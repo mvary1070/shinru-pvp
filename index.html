@@ -423,6 +423,12 @@
     color:var(--txt);font-weight:700;font-size:13px;cursor:pointer;transition:.12s}
   .vcgrid button:hover{background:#221a2c;border-color:var(--gold)}
   .vcgrid button:disabled{opacity:.4;cursor:not-allowed;background:#141018}
+  .vc-declare{display:flex;align-items:center;justify-content:center;gap:18px;margin:16px 0 2px}
+  .vc-step{width:46px;height:46px;font-size:26px;line-height:1;border-radius:9px;background:#1a1206;
+    border:1px solid var(--gold);color:var(--gold);cursor:pointer;transition:.12s}
+  .vc-step:hover{background:#241a0b}
+  .vc-round{font-family:'Cinzel',serif;font-size:22px;color:#f0d68a;min-width:150px;text-align:center}
+  .vc-round b{color:#fff}
 
   /* themed AI card backs (red on cream) */
   .side.ai .card.back{background:
@@ -809,15 +815,18 @@
 <div id="vaultDeclareModal" class="modal hide">
   <div class="sheet" style="width:min(480px,96vw)">
     <h2 style="font-family:'Cinzel',serif">🗄 Commit the Vault</h2>
-    <div class="sub">Declare <b>now</b> which round your Vault unleashes — a commitment you <b>cannot</b> change.
-      Survive to that round and every stashed card fires at once, in sequence. This is long-term planning: pick your moment, then live to reach it.</div>
-    <div class="vcgrid" style="grid-template-columns:1fr 1fr">
-      <button id="vd2" onclick="Vault.setDeclare(2)"></button>
-      <button id="vd3" onclick="Vault.setDeclare(3)"></button>
-      <button id="vd4" onclick="Vault.setDeclare(4)"></button>
-      <button id="vd5" onclick="Vault.setDeclare(5)"></button>
+    <div class="sub">Declare <b>now</b> the round your Vault unleashes — a commitment you <b>cannot</b> change.
+      Minimum <b>3 rounds</b> from now; after that, <b>any</b> round you like. Survive to it and every stashed card fires at once.</div>
+    <div class="vc-declare">
+      <button class="vc-step" onclick="Vault.declStep(-1)" title="Earlier">−</button>
+      <div class="vc-round">Round <b id="vaultDeclareVal">–</b></div>
+      <button class="vc-step" onclick="Vault.declStep(1)" title="Later">+</button>
     </div>
-    <div class="closebar"><span></span><button class="btn ghost" onclick="Vault.cancelDeclare()">Cancel</button></div>
+    <div id="vaultDeclareHint" class="sp-label" style="text-align:center;margin-top:6px"></div>
+    <div class="closebar">
+      <button class="btn ghost" onclick="Vault.cancelDeclare()">Cancel</button>
+      <button class="btn" onclick="Vault.confirmDeclare()">Commit</button>
+    </div>
   </div>
 </div>
 <div id="lowhp"></div>
@@ -1022,7 +1031,7 @@ const CARDS = {
   overcharge:{name:"Overcharge", type:"special", price:100,desc:"Deal 30, but skip your next turn."},
   counter: {name:"Counter",      type:"special", price:85, desc:"For the enemy's next 2 turns, negate & reflect their attack."},
   // passives (rare & powerful — priced high)
-  goldinterest:{name:"Gold Interest",type:"passive",price:160,desc:"+10% gold each round (stops growing after round 10)."},
+  goldinterest:{name:"Gold Interest",type:"passive",price:160,desc:"+50 gold each round, per copy (flat — no cap)."},
   retribution:{name:"Retribution",  type:"passive",price:150,desc:"Every 6th hit to your HP, heal 50% of the HP damage from those 6 hits. Shield-absorbed damage doesn't count."},
   finalstand:{name:"Final Stand",   type:"passive",price:210,desc:"Cheat death: a lethal hit → 1 HP. For 3 rounds you can't die AND your attacks deal +50%. Recharges after 15 rounds."},
   extramove:{name:"Extra Move",     type:"passive",price:180,desc:"Every 3rd round you may play 1 extra card."},
@@ -1053,6 +1062,7 @@ const RETRIB_FRAC = 0.5;  // Retribution: heal this fraction of the HP damage fr
 const FINALSTAND_WINDOW = 3;   // Final Stand: invuln + boost rounds
 const FINALSTAND_ATK    = 1.5; // Final Stand: attack-damage multiplier during the window (+50%)
 const FINALSTAND_CD     = 15;  // Final Stand: recharge rounds after it fires
+const GOLD_INTEREST_BONUS = 50; // Gold Interest: FLAT +N gold/round per copy (no compounding, no cap; drop to 30–40 if too swingy)
 
 const MIRROR_MAX = 10;   // Mirror uses PER TURN (refills each of your turns)
 const HAND_MAX_MIRROR = 17;   // only Mirror can push a hand past 7, up to this
@@ -1158,6 +1168,7 @@ const Game = {
       predict:null, predictReadyRound:0,   // YOUR gamble on the AI: {type,bet} + cooldown round
       aiPredict:null, aiPredictReadyRound:0,   // the AI's gamble on YOU (kept fully secret until it resolves)
       playerHist:{attack:0,defense:0,special:0,skip:0},   // running tally of your move types — feeds the AI's read
+      playerBuys:0, playerPredicts:0,          // more style signals for the AI's adaptation (shopper? gambler?)
     };
     S.secret = Math.random()<0.5?1:2;
     document.querySelectorAll('#firstScreen .emb').forEach(f=>{ f.innerHTML = EMBLEM_SVG; });
@@ -1265,7 +1276,7 @@ function startPlayerTurn(){
   if(dead()) return;
   if(S.me.destroyCd>0) S.me.destroyCd--;         // Destroy-Card cooldown ticks over your turns
   if(S.me.skipNext){ S.me.skipNext=false;
-    if(S.aiPredict) Predict.resolveAi('skip');   // you played nothing this turn → a "skip" for the AI's read
+    // FORCED skip (Overcharge): the AI's prediction on you does NOT cash here — it carries to your next real turn.
     if(S.ai.counterTurns>0) S.ai.counterTurns--; if(S.ai.spyTurns>0) S.ai.spyTurns--;
     log("You are stunned by Overcharge — turn skipped."); S.turn='ai'; render(); setTimeout(aiTurn,700); return; }
   S.me.playedAttackThisTurn=false;
@@ -1304,13 +1315,9 @@ function upkeep(p,who){
 
 // gold earned for a given round (Gold Interest compounds +10%/round, capped at round 10; stacks per copy)
 function roundGold(p, round){
-  const n = passiveCount(p,'goldinterest');
-  if(n>0){
-    const factor = Math.min(round,10);
-    const bonus = Math.round(100 * Math.pow(1.10, factor-1)) - 100;   // the growth from one copy
-    return 100 + n*bonus;                                             // 2 copies = two instances of the bonus
-  }
-  return 100;
+  // FLAT bonus: 100 base + 50 per Gold Interest copy, every round, no compounding, no cap.
+  // (`round` is unused now but kept in the signature for the sandbox round-jump economy.)
+  return 100 + passiveCount(p,'goldinterest')*GOLD_INTEREST_BONUS;
 }
 function gainGold(p,who){
   let g = roundGold(p, S.round);
@@ -1489,7 +1496,7 @@ function aiTurn(){
   document.getElementById('turnWho').textContent='AI thinking…';
   upkeep(S.ai,'ai');
   if(dead()) return;
-  if(S.ai.skipNext){ S.ai.skipNext=false; log("AI is stunned — turn skipped."); finishAiTurn(); return; }
+  if(S.ai.skipNext){ S.ai.skipNext=false; log("AI is stunned — turn skipped."); finishAiTurn(true); return; }   // forced skip: your prediction carries to its next real turn
   S.ai.playedAttackThisTurn=false;
   drawInto(S.ai);
   gainGold(S.ai,'ai');
@@ -1504,137 +1511,241 @@ function aiTurn(){
 }
 function aiTurnMain(){
   render();
-  let plays=0, limit = S.ai.onePlayR>0 ? 1 : 2 + (S.round%3===0 ? passiveCount(S.ai,'extramove') : 0);
-  const act=()=>{
-    if(S.paused){ setTimeout(act, 250); return; }     // pause mid-turn
-    if(plays>=limit || S.ai.hand.length===0){ finishAiTurn(); return; }
-    const idx = aiChoose();
-    if(idx===-1){ finishAiTurn(); return; }
-    playCard('ai', idx);
-    if(dead()) return;
-    plays++;
-    setTimeout(act, ACTION_DELAY);   // readable beat between the AI's plays
-  };
-  // AI shop + vault + read-your-move logic once per turn
+  // once per turn: shop economy, bank a Vault, read the player — THEN plan the whole turn and execute it in order
   aiShop();
   aiVault();
   aiPredict();
+  const plan = aiPlanTurn();          // ordered uids to play this turn (already capped at the play limit)
+  let step=0;
+  const act=()=>{
+    if(S.paused){ setTimeout(act, 250); return; }     // pause mid-turn
+    if(dead()) return;
+    if(step>=plan.length){ finishAiTurn(); return; }
+    const uid=plan[step++];
+    const i=S.ai.hand.findIndex(c=>c.uid===uid);
+    if(i<0){ act(); return; }          // planned card is gone (shouldn't happen) — skip
+    playCard('ai', i);
+    if(dead()) return;
+    setTimeout(act, ACTION_DELAY);      // readable beat between plays
+  };
   if(dead()) return;
   setTimeout(act, ACTION_DELAY);
 }
 
-const DMG_IDS = ['slash','strike','pierce','heavy','crush','combo','drain','overcharge']; // cards that hit (trigger Counter)
-function aiChoose(){
-  const h=S.ai.hand, me=S.me, ai=S.ai, mood=S.aiMood||'random';
-  const findId=id=> h.findIndex(c=>c.id===id);
-  const find=t=> h.findIndex(c=>CARDS[c.id].type===t);
-  const findPassive=()=> h.findIndex(c=>CARDS[c.id].type==='passive' && passiveCount(ai,c.id)<2);   // skip a 3rd copy
-  const firstOf=list=>{ for(const id of list){ const i=findId(id); if(i>=0) return i; } return -1; };
+/* ============================================================
+   AI BRAIN — plays better, never cheats. Only PUBLIC board state:
+   HP, shield, gold, Counter, Awakening, Vault (if it bought Sense),
+   and the player's move-type history. NEVER the player's hand contents.
+   ============================================================ */
+const DMG_IDS = ['slash','strike','pierce','heavy','crush','combo','drain','overcharge']; // any of these sets playedAttackThisTurn
+function isDmgId(id){ return DMG_IDS.includes(id); }
 
-  // Counter awareness: hitting into an active Counter is negated + reflected — avoid it.
-  const counterRisk = me.counterTurns>0;
-  const reckless = mood==='aggressive' && Math.random()<0.25;   // aggressive AI sometimes gambles
-  const avoidHits = counterRisk && !reckless;
-
-  // Awakened THIS round → swing the biggest hit (unless it'd suicide into a Counter)
-  if(awakenActive(ai) && !avoidHits){
-    const i=firstOf(['crush','overcharge','heavy','combo','pierce','drain','strike','slash']); if(i>=0) return i;
+// raw damage a card deals right now, before shield (Combo synergy, Final Stand on attacks, Awakening ×5)
+function aiCardDamage(id, ai, playedAtk){
+  const awk = awakenActive(ai) ? 5 : 1;
+  const fs  = fsAtkMult(ai);
+  switch(id){
+    case 'slash':  return Math.round(8*fs)*awk;
+    case 'strike': return Math.round(11*fs)*awk;
+    case 'pierce': return Math.round(14*fs)*awk;
+    case 'heavy':  return Math.round(18*fs)*awk;
+    case 'crush':  return Math.round(24*fs)*awk;
+    case 'combo':  return (playedAtk?24:10)*awk;
+    case 'drain':  return 12*awk;
+    case 'overcharge': return 30*awk;
+    default: return 0;
   }
-
-  // Low HP → heal / shield (defensive mood is jumpier about it)
-  if(ai.hp < (mood==='defensive'?55:40)){
-    const i=firstOf(['greatheal','heal','bandage','guard','block']); if(i>=0) return i;
+}
+// hp damage from playing these ids IN ORDER vs target (shield soak, pierce −5, combo state) — assumes no Counter
+function aiSeqDamage(ids, ai, target){
+  let shield=target.shield, hpLost=0, playedAtk=ai.playedAttackThisTurn;
+  for(const id of ids){
+    if(id==='pierce') shield=Math.max(0, shield-5);
+    let dmg=aiCardDamage(id, ai, playedAtk);
+    if(dmg>0){ const soak=Math.min(shield,dmg); shield-=soak; dmg-=soak; hpLost+=dmg; }
+    if(isDmgId(id)) playedAtk=true;
   }
-
-  // Lethal push when the player is low (still won't suicide into a Counter)
-  if(me.hp<=30 && !avoidHits){
-    const i=firstOf(['crush','overcharge','heavy','combo','pierce','strike']); if(i>=0) return i;
-  }
-
-  // Vault threat: if it can SEE you stacking a bomb (has Vault Sense), it braces with defenses
-  if(ai.vaultSense && me.vault.length>=2){
-    const i=firstOf(['counter','guard','block','greatheal','heal']); if(i>=0) return i;
-  }
-
-  // Counter is up and we're not reckless → play only non-hitting cards; otherwise hold fire.
-  if(avoidHits){
-    const i=firstOf(['bleed','counter','guard','block','greatheal','heal','bandage']); if(i>=0) return i;
-    if(ai.passives.length<PASSIVE_SLOTS){ const p=findPassive(); if(p>=0) return p; }
-    return -1;   // anything left is a hit (or an unplayable passive) → don't reflect into ourselves
-  }
-
-  // Install a passive early
-  if(ai.passives.length<PASSIVE_SLOTS){ const p=findPassive(); if(p>=0 && Math.random()<(mood==='defensive'?0.85:0.6)) return p; }
-
-  // Mood-weighted default order
-  let order;
-  if(mood==='aggressive')      order=['crush','heavy','overcharge','combo','pierce','drain','strike','slash','bleed','guard','block','heal','bandage','greatheal'];
-  else if(mood==='defensive')  order=['guard','block','greatheal','heal','bleed','pierce','combo','strike','drain','slash','heavy','crush','overcharge','bandage'];
-  else                         order=['crush','heavy','pierce','combo','drain','strike','bleed','slash','overcharge','guard','block','heal','bandage','greatheal'];
-  const i=firstOf(order); if(i>=0) return i;
-
-  const s=find('special'); if(s>=0) return s;
-  const d=find('defense'); if(d>=0) return d;
-  // fallback: first ACTUALLY-playable card (a maxed / no-slot passive would just be rejected)
-  for(let i=0;i<h.length;i++){
-    if(CARDS[h[i].id].type!=='passive') return i;
-    if(passiveCount(ai,h[i].id)<2 && ai.passives.length<PASSIVE_SLOTS) return i;
-  }
-  return -1;   // nothing installable → hold fire (don't burn plays on rejects)
+  return hpLost;
+}
+function permute(a){ if(a.length<=1) return [a]; const out=[]; a.forEach((x,i)=>{ for(const p of permute(a.slice(0,i).concat(a.slice(i+1)))) out.push([x,...p]); }); return out; }
+function kSubsets(arr, kmax){ const res=[]; const rec=(start,cur)=>{ if(cur.length) res.push(cur.slice()); if(cur.length>=kmax) return; for(let i=start;i<arr.length;i++){ cur.push(arr[i]); rec(i+1,cur); cur.pop(); } }; rec(0,[]); return res; }
+function aiBestOrder(cards, ai, target){   // cards: [{uid,id}] → best-damage ordering
+  let best=cards, bestD=-1;
+  for(const p of (cards.length<=4?permute(cards):[cards])){ const d=aiSeqDamage(p.map(c=>c.id), ai, target); if(d>bestD){ bestD=d; best=p; } }
+  return {cards:best, dmg:bestD};
+}
+// can the AI kill the player this turn? → ordered uids, or null (never plans a kill THROUGH an active Counter)
+function aiFindLethal(limit){
+  const ai=S.ai, me=S.me;
+  if(me.counterTurns>0) return null;
+  const dmgCards = ai.hand.filter(c=>aiCardDamage(c.id, ai, true)>0);
+  if(!dmgCards.length) return null;
+  const subs = kSubsets(dmgCards, Math.min(limit, dmgCards.length)).sort((a,b)=>a.length-b.length);
+  for(const sub of subs){ const ord=aiBestOrder(sub, ai, me); if(ord.dmg >= me.hp) return ord.cards.map(c=>c.uid); }
+  return null;
+}
+// realistic damage the player could do to the AI next turn (public info only)
+function estimatePlayerBurst(){
+  const me=S.me, ai=S.ai;
+  const plays = me.onePlayR>0 ? 1 : 2 + (S.round%3===0 ? passiveCount(me,'extramove') : 0);
+  const perPlay = me.gold>=130 ? 22 : me.gold>=75 ? 16 : 12;   // richer player → bigger attacks affordable
+  let burst = perPlay * Math.min(plays,2);
+  if(me.awakenAt!==null && !me.awakenSpent && (me.awakenAt+AWAKEN_DELAY - S.round)<=1) burst += 110;  // an imminent ×5 swing
+  if(ai.vaultSense && me.vault.length) burst += 14*me.vault.length;                                    // a Vault it can see building
+  if(ai.bleedTurns>0) burst += ai.bleed;                                                               // bleed already on us
+  return burst;
+}
+// player-style read (only public info)
+function aiRead(){
+  const h=S.playerHist||{}, atk=h.attack||0, def=h.defense||0, spc=h.special||0, skp=h.skip||0;
+  return { atk, def, spc, tot:atk+def+spc+skp+1, aggro: atk>def+2, turtle: def>atk+2,
+    economy:(S.playerBuys||0), prediction:(S.playerPredicts||0) };
+}
+// is the player likely to attack next turn? (→ good moment to set Counter)
+function counterHoldGood(read){
+  const me=S.me;
+  const awakSoon = me.awakenAt!==null && !me.awakenSpent && (me.awakenAt+AWAKEN_DELAY - S.round)<=1;
+  return read.aggro || awakSoon || me.lastPlayType==='defense' || me.hand.length<=2;
 }
 
-// AI buys from a fresh stall roll, weighted by its mood
-function aiPickCard(mood, gold){
-  const roll=rollOffers().map(o=>o.id).filter(id=>CARDS[id].price<=gold);
-  if(!roll.length) return null;
-  const score=id=>{ const c=CARDS[id]; let s=(c.price||40)/12;
-    if(mood==='aggressive'){ if(c.type==='attack')s+=10; if(c.type==='special')s+=6; }
-    else if(mood==='defensive'){ if(c.type==='defense')s+=10; if(c.type==='passive')s+=6; }
-    else { s += id.charCodeAt(id.length-1)%7; }
-    return s; };
-  roll.sort((a,b)=>score(b)-score(a));
-  return roll[0];
+// plan the whole turn: LETHAL → SURVIVE → set-up → VALUE (with good sequencing). Returns ordered uids ≤ play limit.
+function aiPlanTurn(){
+  const ai=S.ai, me=S.me;
+  const limit = ai.onePlayR>0 ? 1 : 2 + (S.round%3===0 ? passiveCount(ai,'extramove') : 0);
+  const hand = ai.hand, plan=[], used=new Set();
+  const cardOf = uid => hand.find(c=>c.uid===uid);
+  const free = () => plan.length < limit;
+  const takeId = (...ids)=>{ if(!free()) return false; for(const id of ids){ const c=hand.find(x=>!used.has(x.uid)&&x.id===id); if(c){ used.add(c.uid); plan.push(c.uid); return true; } } return false; };
+  const has = id => hand.some(c=>!used.has(c.uid)&&c.id===id);
+  const slotsFree = () => PASSIVE_SLOTS - ai.passives.length - plan.filter(u=>CARDS[cardOf(u).id].type==='passive').length;
+  const plannedIdCount = id => plan.filter(u=>cardOf(u).id===id).length;
+  const takePassive = (read)=>{
+    if(!free() || slotsFree()<=0) return false;
+    const avail = id => hand.find(c=>!used.has(c.uid)&&c.id===id && passiveCount(ai,id)+plannedIdCount(id) < 2);
+    let order;
+    if(read.economy>=2)  order=['shoplock','goldinterest','finalstand','retribution','extramove'];  // vs a heavy shopper
+    else if(S.round<=8)  order=['goldinterest','finalstand','retribution','extramove','shoplock'];   // compound gold early
+    else                 order=['finalstand','retribution','extramove','goldinterest','shoplock'];   // grind insurance later
+    for(const id of order){ const c=avail(id); if(c){ used.add(c.uid); plan.push(c.uid); return true; } }
+    const any=hand.find(c=>!used.has(c.uid)&&CARDS[c.id].type==='passive'&&passiveCount(ai,c.id)+plannedIdCount(c.id)<2);
+    if(any){ used.add(any.uid); plan.push(any.uid); return true; }
+    return false;
+  };
+  const takeBestDamage = ()=>{   // best next hitter, honoring sequencing
+    if(!free()) return false;
+    const plannedAtk = ai.playedAttackThisTurn || plan.some(u=>isDmgId(cardOf(u).id));
+    let best=null, bestScore=-1;
+    for(const c of hand){ if(used.has(c.uid)) continue;
+      const dmg=aiCardDamage(c.id, ai, plannedAtk); if(dmg<=0) continue;
+      let score=dmg;
+      if(c.id==='combo' && !plannedAtk && hand.some(h=>!used.has(h.uid)&&h.uid!==c.uid&&isDmgId(h.id))) score-=20; // play an attack FIRST, then Combo
+      if(c.id==='pierce' && me.shield>0) score+=6;                                                                  // Pierce shreds shield
+      if(c.id==='overcharge') score-=6;                                                                             // it self-stuns
+      if(score>bestScore){ bestScore=score; best=c.uid; }
+    }
+    if(best!==null){ used.add(best); plan.push(best); return true; }
+    return false;
+  };
+
+  const counterUp = me.counterTurns>0;
+  const read = aiRead();
+
+  // 1) LETHAL — take the kill if we have it (and no Counter is up).
+  if(!counterUp){ const lethal=aiFindLethal(limit); if(lethal) return lethal.slice(0,limit); }
+
+  // 2) SURVIVE — defend BEFORE we're nearly dead (proactive threat assessment, not a fixed HP line).
+  const burst = estimatePlayerBurst();
+  const danger = (ai.hp + ai.shield) <= burst + 6;
+  if(danger){
+    if(ai.hp < ai.maxHp-10) takeId('greatheal','heal','bandage');
+    if(free() && (ai.hp+ai.shield) <= burst) takeId('guard','block');
+    if(free() && counterHoldGood(read) && has('counter') && !counterUp) takeId('counter');
+    while(free()){
+      if(!counterUp && takeBestDamage()) continue;   // a safe counter-punch if there's room
+      if(takeId('bleed')) continue;
+      if(takeId('guard','block')) continue;
+      if(takePassive(read)) continue;
+      break;
+    }
+    return plan;
+  }
+
+  // 3) COUNTER HOLD — set Counter only when the player is very likely to attack next turn.
+  if(free() && counterHoldGood(read) && has('counter') && !counterUp) takeId('counter');
+
+  // 4) PASSIVE — fill a slot early / when idle.
+  if(free() && slotsFree()>0 && ai.passives.length<PASSIVE_SLOTS) takePassive(read);
+
+  // 5) VALUE — offense with good sequencing; if Counter is up, apply pressure without feeding it.
+  while(free()){
+    if(!counterUp && takeBestDamage()) continue;
+    if(takeId('bleed')) continue;
+    if(!counterUp && takeId('drain')) continue;
+    if(ai.hp < ai.maxHp-18 && takeId('heal','bandage','greatheal')) continue;
+    if(takeId('guard','block')) continue;
+    if(takePassive(read)) continue;
+    break;
+  }
+  return plan;
 }
 
 function aiShop(){
   if(shopLocked(S.ai) || S.ai.noShopR>0) return;   // Shop Lock or its own Vault restriction denies the shop
   const ai=S.ai, me=S.me, mood=S.aiMood||'random';
-  // 0) Buy Vault Sense if it suspects (probabilistic) — lets it react to your Vault
-  if(!ai.vaultSense && ai.gold>=VAULT_SENSE_COST && Math.random()<0.3){
-    ai.gold-=VAULT_SENSE_COST; ai.vaultSense=true; log("AI buys <b>Vault Sense</b>."); return;
-  }
-  // 1) Hard-counter the player's Awakening with Destroy
+  const read=aiRead();
+  const burst=estimatePlayerBurst();
+  const danger=(ai.hp+ai.shield)<=burst+6;
+
+  // 1) Cancel the player's Awakening — the single highest-value buy.
   const playerArming = me.awakenAt!==null && !me.awakenSpent;
-  if(playerArming && ai.gold>=250 && Math.random()<0.75){
+  if(playerArming && ai.gold>=250){
     ai.gold-=250; me.awakenAt=null; me.awakenSpent=false;
     FX.banner('✖ AWAKENING CANCELLED','#e63946'); FX.sfxAwakenCancel();
     log("AI buys <b>Cancel Awakening</b> — your Awakening is gone!"); return;
   }
-  // 2) Arm its own Awakening (aggressive leans in)
-  const armChance = mood==='aggressive'?0.5 : mood==='defensive'?0.2 : 0.35;
-  if((ai.awakenAt===null||ai.awakenSpent) && ai.gold>=300 && Math.random()<armChance){
-    ai.gold-=300; ai.awakenAt=S.round; ai.awakenSpent=false; FX.sfxAwakenArm(); log("AI buys <b>Awakening</b>."); return;
-  }
-  // 2b) Card Swap — when its hand has no high-impact card and it has spare gold, trade the weakest for two draws
-  const strongCards=['crush','heavy','overcharge','greatheal','guard','pierce','combo'];
-  const poorHand = ai.hand.length>=2 && !ai.hand.some(c=>strongCards.includes(c.id));
-  if(poorHand && ai.gold>=70 && Math.random()<0.45){
+  // hold a 250 reserve to cancel a LIKELY Awakening when the player is hoarding gold
+  const reserve = (me.gold>=250 && !playerArming) ? 250 : 0;
+  const spend = Math.max(0, ai.gold - reserve);
+
+  // 2) Poor hand → Card Swap (cheap, high value).
+  const strong=['crush','heavy','overcharge','greatheal','guard','pierce','combo'];
+  const poorHand = ai.hand.length>=2 && !ai.hand.some(c=>strong.includes(c.id));
+  if(poorHand && spend>=70){
     ai.gold-=70;
-    let wi=0, wp=Infinity;
-    ai.hand.forEach((c,i)=>{ const pr=CARDS[c.id].price||40; if(pr<wp){ wp=pr; wi=i; } });   // dump the cheapest/weakest
-    ai.hand.splice(wi,1);
-    drawInto(S.ai); drawInto(S.ai);
+    let wi=0, wp=Infinity; ai.hand.forEach((c,i)=>{ const pr=CARDS[c.id].price||40; if(pr<wp){wp=pr;wi=i;} });
+    ai.hand.splice(wi,1); drawInto(S.ai); drawInto(S.ai);
     log("AI uses <b>Card Swap</b> — trades a weak card for two draws."); return;
   }
-  // 3) Buy a card from the stall, mood-weighted
-  if(ai.hand.length<7 && ai.gold>=40 && Math.random()<0.55){
-    const id=aiPickCard(mood, ai.gold);
-    if(id){ ai.gold-=CARDS[id].price; ai.hand.push({uid:uidCounter++,id}); log(`AI buys a <b>${CARDS[id].name}</b>.`); }
+  // 3) In danger with no defense in hand → buy protection now.
+  if(danger && !ai.hand.some(c=>['guard','block','greatheal','heal','bandage'].includes(c.id))){
+    const id = spend>=80?'guard' : spend>=65?'heal' : spend>=45?'block' : null;
+    if(id){ ai.gold-=CARDS[id].price; ai.hand.push({uid:uidCounter++,id}); log(`AI buys a <b>${CARDS[id].name}</b>.`); return; }
   }
+  // 4) Adaptation — vs a turtle, pressure with Bleed.
+  if(read.turtle && spend>=CARDS.bleed.price && !ai.hand.some(c=>c.id==='bleed')){
+    ai.gold-=CARDS.bleed.price; ai.hand.push({uid:uidCounter++,id:'bleed'}); log("AI buys a <b>Bleed</b>."); return;
+  }
+  // 5) Vault Sense when the player looks like they might be banking (rich, and not just brawling).
+  if(!ai.vaultSense && spend>=VAULT_SENSE_COST && me.gold>=120 && !read.aggro && Math.random()<0.3){
+    ai.gold-=VAULT_SENSE_COST; ai.vaultSense=true; log("AI buys <b>Vault Sense</b>."); return;
+  }
+  // 6) Arm Awakening only when safe and gold-rich (protected by the reserve above).
+  if((ai.awakenAt===null||ai.awakenSpent) && !danger && spend>=300 && ai.hp>=45){
+    const armChance = mood==='aggressive'?0.55 : mood==='defensive'?0.3 : 0.42;
+    if(Math.random()<armChance){ ai.gold-=300; ai.awakenAt=S.round; ai.awakenSpent=false; FX.sfxAwakenArm(); log("AI buys <b>Awakening</b>."); return; }
+  }
+  // 7) Buy a finisher when the hand lacks a big hit and there's real gold to spare — otherwise SAVE.
+  if(spend>=95 && ai.hand.length<7 && !ai.hand.some(c=>['crush','heavy'].includes(c.id))){
+    const id = spend>=130?'crush':'heavy';
+    ai.gold-=CARDS[id].price; ai.hand.push({uid:uidCounter++,id}); log(`AI buys a <b>${CARDS[id].name}</b>.`); return;
+  }
+  // else: hold gold for a high-value moment.
 }
 
-function finishAiTurn(){
-  if(S.predict) Predict.resolve('skip');   // AI played no card this turn → a "skip"
+function finishAiTurn(forcedSkip){
+  // A prediction only cashes on a VOLUNTARY no-play. A FORCED stun-skip does NOT resolve it —
+  // the bet carries over to the AI's next real (non-skipped) turn. (Closes the Overcharge→"Skip" loophole.)
+  if(S.predict && !forcedSkip) Predict.resolve('skip');
   log("AI ends its turn.");
   S.ai.playedAttackThisTurn=false;
   if(S.me.counterTurns>0) S.me.counterTurns--;   // your Counter counts down over the AI's turns
@@ -1740,6 +1851,7 @@ const Shop={
     if(S.me.gold<c.price){ toast("Not enough gold."); FX.sfxDenied(); return; }
     S.me.gold-=c.price; offer.sold=true;
     S.me.hand.push({uid:uidCounter++, id:offer.id});
+    S.playerBuys=(S.playerBuys||0)+1;   // the AI notices you're a shopper
     FX.sfxPurchase();
     log(`You buy the card <b>${c.name}</b>.`);
     render(); Shop.render();
@@ -1749,7 +1861,7 @@ const Shop={
     S.me.gold-=it.cost;
     const ok=it.run();
     if(ok===false){ S.me.gold+=it.cost; FX.sfxDenied(); } // refund if the action couldn't happen
-    else { FX.sfxPurchase(); log(`You buy <b>${it.name}</b>.`); }
+    else { S.playerBuys=(S.playerBuys||0)+1; FX.sfxPurchase(); log(`You buy <b>${it.name}</b>.`); }
     render(); Shop.render();
   },
   close(){ document.getElementById('shopPanel').classList.remove('open'); }
@@ -1794,6 +1906,7 @@ const Predict = {
   },
   place(type,bet){
     S.me.gold-=bet; S.predict={type,bet}; S.predictReadyRound=S.round+PRED_CD;
+    S.playerPredicts=(S.playerPredicts||0)+1;   // the AI notices you're a gambler
     this.close(); render(); FX.sfxPredictPlace();   // quiet, secretive — it's hidden info
     // SILENT: nothing goes to the shared battle log while a prediction is pending (no leak) — only the toast + your private HUD.
     toast(`Predicting ${PRED_TYPES[type]} · ${bet}g — win pays ${bet*PRED_MULT}g.`);
@@ -1877,13 +1990,21 @@ const Vault = {
     if(S.me.vault.length===0 && !S.me.vaultRound){ this.declarePrompt(); return; }
     this.pickCardToStash();
   },
-  // step 1: commit the unleash round (only asked when starting a new Vault)
-  declarePrompt(){
-    const set=(id,n)=>{ const b=document.getElementById(id); if(b) b.textContent=`In ${n} rounds · Round ${S.round+n}`; };
-    set('vd2',2); set('vd3',3); set('vd4',4); set('vd5',5);
-    show('vaultDeclareModal', true);
+  // step 1: commit the unleash round (only asked when starting a new Vault).
+  // Rule: minimum 3 rounds from now, then ANY round beyond (no upper limit); free choice via the ± picker.
+  declRound:0,
+  declMin(){ return S.round + 3; },
+  declarePrompt(){ this.declRound = this.declMin(); this.renderDecl(); show('vaultDeclareModal', true); },
+  renderDecl(){
+    const v=document.getElementById('vaultDeclareVal'); if(v) v.textContent=this.declRound;
+    const h=document.getElementById('vaultDeclareHint');
+    if(h){ const k=this.declRound-S.round; h.textContent=`In ${k} round${k===1?'':'s'} · earliest is Round ${this.declMin()} (3 rounds away)`; }
   },
-  setDeclare(n){ this.pendingRound=S.round+n; show('vaultDeclareModal', false); this.pickCardToStash(); },
+  declStep(d){ this.declRound = Math.max(this.declMin(), this.declRound + d); this.renderDecl(); },   // no upper cap
+  confirmDeclare(){
+    if(this.declRound < this.declMin()){ toast(`Earliest unleash is Round ${this.declMin()} (3 rounds away).`); return; }
+    this.pendingRound = this.declRound; show('vaultDeclareModal', false); this.pickCardToStash();
+  },
   cancelDeclare(){ this.pendingRound=null; show('vaultDeclareModal', false); },
   // step 2: pick which card to stash
   pickCardToStash(){
@@ -1976,41 +2097,60 @@ const Vault = {
   },
 };
 
-// AI Vault (mood-driven): declares a hidden unleash round when it starts stashing, then adds cards.
-// Stashing is SILENT (only Vault Sense reveals the count); the unleash itself is public.
+// AI Vault: only START a Vault it can build into a real bomb, then FILL it toward capacity (3–4) before the
+// committed round. Never banks a card it needs now; never commits to a nearly-empty vault. Min 3 rounds (then free),
+// mirroring the player's rule. Stashing is SILENT (Vault Sense shows only the count).
+const VAULT_POOL = ['crush','heavy','overcharge','pierce','combo'];   // real threats worth banking
 function aiVault(){
-  const ai=S.ai, mood=S.aiMood||'random';
+  const ai=S.ai, me=S.me, mood=S.aiMood||'random';
   if(ai.vault.length>=VAULT_MAX) return;                 // full — wait for the committed round
-  if(ai.gold<VAULT_GOLD_COST) return;                    // AI always pays gold to stash
-  const stashChance = mood==='aggressive'?0.30 : mood==='defensive'?0.12 : 0.18;
-  if(Math.random()>=stashChance) return;
-  // aggressive/random hoard attackers for a burst; defensive tucks away recovery + a finisher
-  const pool = mood==='defensive'
-      ? ['greatheal','guard','heal','block','overcharge','crush']
-      : ['crush','heavy','overcharge','combo','pierce','drain','strike'];
-  const idx = ai.hand.findIndex(c=> CARDS[c.id].type!=='passive' && pool.includes(c.id));
-  if(idx<0) return;
-  if(ai.vault.length===0 && !ai.vaultRound){             // commit the round on the first stash
-    const horizon = mood==='aggressive' ? 2+Math.floor(Math.random()*2)   // 2–3 rounds (fast bomb)
-                                        : 3+Math.floor(Math.random()*3);   // 3–5 rounds (patient)
+  if(ai.gold<VAULT_GOLD_COST) return;                    // the AI always pays gold to stash
+  const limit = ai.onePlayR>0 ? 1 : 2 + (S.round%3===0 ? passiveCount(ai,'extramove') : 0);
+  if(me.counterTurns===0 && aiFindLethal(limit)) return; // don't bank when we can just win now
+  if((ai.hp+ai.shield) <= estimatePlayerBurst()+6) return; // in danger — keep our cards to survive
+  const poolIdx = ai.hand.findIndex(c=> VAULT_POOL.includes(c.id));
+  if(poolIdx<0) return;                                   // nothing worth banking
+  const hitters = ai.hand.filter(c=>isDmgId(c.id)).length;
+  const started = ai.vault.length>0 && ai.vaultRound>0;
+
+  if(!started){
+    // START only if we can commit to a genuine bomb: ≥2 bankable threats AND still keep ≥2 hitters for now.
+    // (If we can only spare 1 card, we don't vault at all — a near-empty vault is worthless.)
+    const bankable = ai.hand.filter(c=>VAULT_POOL.includes(c.id)).length;
+    if(bankable < 2 || hitters < 3) return;
+    const startChance = mood==='aggressive'?0.34 : mood==='defensive'?0.18 : 0.24;
+    if(Math.random()>=startChance) return;
+    // commit a round: MIN 3 (then free), sooner within that if the player is already low
+    const horizon = 3 + (me.hp<=45 ? 0 : 1) + Math.floor(Math.random()*2);   // 3–4 (low player) or 4–5
     ai.vaultRound = S.round + horizon;
+  } else {
+    // ALREADY building → eagerly FILL toward capacity, as long as we keep ≥1 hitter this turn.
+    if(hitters < 2) return;
+    if(Math.random() >= 0.75) return;   // most turns it adds a card until full or the round arrives
   }
   ai.gold-=VAULT_GOLD_COST;
-  ai.vault.push(ai.hand.splice(idx,1)[0]);
-  // no log — the AI's Vault build is secret unless you bought Vault Sense (which shows only the count)
+  ai.vault.push(ai.hand.splice(poolIdx,1)[0]);
+  // no log — the Vault build is secret unless you bought Vault Sense
 }
-// place a secret bet on the human's NEXT play type — simple history-weighted guess (no mind-reading)
+// place a secret bet on the human's NEXT play type — PATTERN-based read, bet scaled by confidence.
 function aiPredict(){
-  const ai=S.ai;
+  const ai=S.ai, me=S.me;
   if(S.aiPredict) return;                                // one active read at a time
   if(S.round < S.aiPredictReadyRound) return;            // 3-round cooldown
   if(ai.gold < PRED_MIN) return;                         // must afford the min bet
-  if(Math.random() < 0.5) return;                        // it doesn't read every chance — keep it human
-  const h=S.playerHist, types=['attack','defense','special','skip'];
-  const weights=types.map(t=> 1 + (h[t]||0));            // +1 base so every type stays possible; leans toward your habits
-  let tot=weights.reduce((a,b)=>a+b,0), r=Math.random()*tot, type='attack';
-  for(let i=0;i<types.length;i++){ r-=weights[i]; if(r<=0){ type=types[i]; break; } }
-  const bet = ai.gold>=600 ? Math.min(ai.gold,200) : PRED_MIN;   // light scaling; stays modest
+  const h=S.playerHist||{};
+  const scores = { attack:(h.attack||0), defense:(h.defense||0), special:(h.special||0), skip:(h.skip||0) };
+  if(me.lastPlayType==='defense') scores.attack += 3;    // players tend to SWING right after they patch up
+  if(me.hp<=35)                   scores.defense += 3;    // and TURTLE when low
+  if(me.counterTurns>0)           scores.special += 1;
+  let total=0, type='attack', top=-1;
+  for(const k in scores){ total+=scores[k]; if(scores[k]>top){ top=scores[k]; type=k; } }
+  if(total < 3) return;                                  // not enough of a read yet — don't gamble blind
+  const confidence = top/total;
+  if(confidence < 0.34 && Math.random()<0.5) return;     // very weak read → often skip
+  // scale the stake to confidence: minimum on a weak read, a real chunk of gold on a strong one (capped).
+  const frac = confidence>=0.6 ? 0.30 : confidence>=0.45 ? 0.18 : 0;   // 0 → minimum bet
+  const bet = Math.min(ai.gold, Math.max(PRED_MIN, Math.round(ai.gold*frac/50)*50));
   ai.gold-=bet;
   S.aiPredict={type,bet};
   S.aiPredictReadyRound=S.round+PRED_CD;
@@ -2507,7 +2647,7 @@ const MECHANICS = [
   ["Final Stand","Cheat death: a lethal hit leaves you at 1 HP; for the next 3 rounds you can't die (HP floored at 1) AND your attacks deal +50% — your comeback window. After it ends you keep whatever HP you have. Recharges 15 rounds after it fires, so it can save you again."],
   ["Role Swap ★","Secret win-state (enable in Loadout). At exactly HP 20 / enemy 50 / 1000 gold / a hand of only special cards, you swap everything with the enemy and your gold drops to 0. Fires once per match."],
   ["Turn timer","Shrinks over the match: 2:00 (rounds 1–10), 1:20 (11–20), 1:00 (21+). Rewards fast, adaptable play."],
-  ["Gold","+100 at the start of each of your turns. The Gold Interest passive compounds +10%/round, capped after round 10."],
+  ["Gold",`+100 at the start of each of your turns. The Gold Interest passive adds a FLAT +${GOLD_INTEREST_BONUS} gold/round per copy (no compounding, no cap), starting the round after you equip it.`],
   ["Draw pile","Shared by both duelists — the top card is face-up so you can race for it. Hand limit is 7 cards."],
 ];
 
