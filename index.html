@@ -4869,6 +4869,7 @@
       peeked: [],
       mirrorCharges: MIRROR_MAX,
       destroyCd: 0,
+      destroyReveal: false, // PvP: while true you're mid-Destroy-Card and may see the opponent's hand to pick
       shopLockRounds: [],
       retribHits: 0,
       retribDmg: 0,
@@ -5027,6 +5028,7 @@
       round: 1,
       turn: null,
       first: null,
+      mode: opts.mode === "pvp" ? "pvp" : "single", // 'pvp' = two humans (server-authoritative); 'single' = offline vs-AI
       deck: makeDeck(),
       me: freshPlayer(),
       ai: freshPlayer(),
@@ -5044,6 +5046,7 @@
       revealAll: false,
       animating: false,
       over: false, // input lock while an effect sequence plays / match has ended
+      winnerSeat: null, // 'p1' | 'p2' when the match is decided (server/PvP; p1='me', p2='ai')
       predict: null,
       predictReadyRound: 0, // YOUR gamble on the AI: {type,bet} + cooldown round
       aiPredict: null,
@@ -5157,10 +5160,7 @@
 
     /* ---- turn structure ---- */
     playLimit() {
-      if (S.me.onePlayR > 0) return 1; // Vault self-restriction: only 1 play/turn
-      let lim = 2;
-      if (S.round % 3 === 0) lim += passiveCount(S.me, "extramove"); // +1 per Extra Move copy on every 3rd round
-      return lim;
+      return playLimitFor(S.me);
     },
 
     endTurn() {
@@ -5220,6 +5220,14 @@
       checkRoleSwap();
     },
   };
+
+  // plays allowed this turn for a given side (side-aware so PvP can ask it for either human)
+  function playLimitFor(p) {
+    if (p.onePlayR > 0) return 1; // Vault self-restriction: only 1 play/turn
+    let lim = 2;
+    if (S.round % 3 === 0) lim += passiveCount(p, "extramove"); // +1 per Extra Move copy on every 3rd round
+    return lim;
+  }
 
   function startPlayerTurn() {
     // start-of-turn upkeep
@@ -5319,11 +5327,16 @@
     if (!inst) return;
     const c = CARDS[inst.id];
 
-    // real-game rules apply in the sandbox too (you play only your own turn)
-    if (who === "me") {
-      if (S.turn !== "me" || S.paused || S.animating || S.over) return; // locked while an effect sequence plays / match ended
-      if (S.cardsPlayed >= Game.playLimit()) {
-        toast("No plays left this turn.");
+    // Turn/limit guards apply to the ACTIVE HUMAN. Offline that's only 'me' (the AI is driven by its trusted
+    // loop, which respects the limit itself). In PvP BOTH sides are humans, so the guards apply to whoever's
+    // turn it is — and a player may only ever play on their own turn.
+    const pvp = S.mode === "pvp";
+    if (pvp && who !== S.turn) return; // in PvP you may only play on your own turn (the server also enforces this)
+    const human = pvp || who === "me";
+    if (human) {
+      if (S.turn !== who || S.paused || S.animating || S.over) return; // locked while an effect sequence plays / match ended
+      if (S.cardsPlayed >= playLimitFor(p)) {
+        if (who === "me") toast("No plays left this turn.");
         return;
       }
     }
@@ -5351,7 +5364,7 @@
       S.playerHist[t] = (S.playerHist[t] || 0) + 1; // feed the AI's read of you
       if (S.aiPredict) Predict.resolveAi(c.type); // the AI's gamble resolves on YOUR next play
     }
-    if (who === "me") S.cardsPlayed++; // every card — including a passive — costs 1 of your 2 plays
+    if (human) S.cardsPlayed++; // every card — including a passive — costs 1 of the active player's plays
 
     render();
     if (dead()) return;
@@ -7031,6 +7044,302 @@
     }
   }
 
+  /* ############################################################################
+   ##########   PVP TURN ENGINE — two logged-in humans (server-authority)   #####
+   Runs ONLY when state.mode === 'pvp' (offline vs-AI never touches any of this). It mirrors the
+   single-player flow (startPlayerTurn / endTurn / finishAiTurn) but is ROLE-GENERIC and NEVER invokes
+   the AI — ending a turn hands control to the OTHER human. Fixed seat map: p1 == engine side 'me',
+   p2 == 'ai'; redactView swaps perspective so each client still renders itself at the bottom. Every
+   handler acts on the side whose turn it is; the server derives that side from the authenticated seat,
+   so a browser can neither act out of turn nor act as its opponent. On the server all UI.after pacing
+   collapses to run-now, so a whole turn/unleash resolves synchronously within one applyAction call.
+   ############################################################################ */
+  const PVP_OPP = { me: "ai", ai: "me" };
+  function pvpSide(side) {
+    return side === "ai" ? S.ai : S.me;
+  }
+  // stamp the winner seat the moment either player is dead (dead()/over() can set S.over without a seat)
+  function pvpResolveOver() {
+    const meDead = S.me.hp <= 0,
+      aiDead = S.ai.hp <= 0;
+    if (meDead || aiDead) {
+      S.over = true;
+      if (!S.winnerSeat) {
+        // double-KO tie-break: the player who just acted (the side on turn) wins. Otherwise the survivor wins.
+        S.winnerSeat =
+          meDead && aiDead ? (S.turn === "me" ? "p1" : "p2") : meDead ? "p2" : "p1";
+      }
+      return true;
+    }
+    return !!S.over;
+  }
+  // start the match once both players are in (the server flips the coin and passes `first`)
+  function pvpBegin(first) {
+    S.first = first === "ai" ? "ai" : "me";
+    S.round = 1;
+    for (let i = 0; i < 7; i++) {
+      drawInto(S.me);
+      drawInto(S.ai);
+    }
+    S.turn = S.first;
+    log(`<b>Match start.</b> ${S.first === "me" ? "Player 1" : "Player 2"} leads.`);
+    pvpStartTurn(S.first);
+  }
+  // start-of-turn upkeep for either human (parallels startPlayerTurn, role-generic)
+  function pvpStartTurn(side) {
+    if (pvpResolveOver()) return;
+    const p = pvpSide(side);
+    upkeep(p, side);
+    if (pvpResolveOver()) return;
+    if (p.destroyCd > 0) p.destroyCd--; // Destroy-Card cooldown ticks over that side's own turns
+    if (p.skipNext) {
+      // FORCED skip (Overcharge): the opponent's prediction on you does NOT cash — it carries to your next real turn.
+      p.skipNext = false;
+      log(`${side === "me" ? "Player 1 is" : "Player 2 is"} stunned by Overcharge — turn skipped.`);
+      pvpEndTurn(side, true);
+      return;
+    }
+    p.playedAttackThisTurn = false;
+    S.cardsPlayed = 0;
+    p.mirrorCharges = MIRROR_MAX;
+    p.destroyReveal = false;
+    S.cardOffers = rollOffers();
+    drawInto(p);
+    gainGold(p, side);
+    // committed Vault auto-unleashes on the declared round (fires to completion, then the turn continues)
+    if (p.vaultRound && S.round >= p.vaultRound && p.vault.length) {
+      pvpUnleash(side);
+      pvpResolveOver();
+      return;
+    }
+    if (p.vaultRound && S.round >= p.vaultRound) p.vaultRound = 0; // committed but empty
+  }
+  function pvpUnleash(side) {
+    const p = pvpSide(side),
+      opp = pvpSide(PVP_OPP[side]);
+    const cards = p.vault.slice();
+    p.vault = [];
+    p.vaultRound = 0;
+    if (!cards.length) return;
+    FX.banner("💥 VAULT UNLEASHED", "#ff8a3d");
+    log(
+      `💥 <b>VAULT UNLEASHED</b> — ${side === "me" ? "Player 1's" : "Player 2's"} committed ${cards.length}-card Vault fires one at a time.`,
+    );
+    unleashSequence(cards, p, opp, side, () => {
+      checkRoleSwap();
+    });
+  }
+  // end-of-turn for either human: pass control to the OTHER human (parallels endTurn + finishAiTurn)
+  function pvpEndTurn(side, forced) {
+    if (S.over) return;
+    const opp = PVP_OPP[side];
+    const meP = pvpSide(side),
+      oppP = pvpSide(opp);
+    // a VOLUNTARY no-play resolves the OPPONENT's pending bet ON YOU as 'skip'. A FORCED stun-skip does NOT
+    // cash it (the bet carries to your next real turn) — this closes the Overcharge→"Skip" loophole.
+    if (!forced && S.cardsPlayed === 0) {
+      if (side === "me") {
+        if (S.aiPredict) Predict.resolveAi("skip");
+      } else {
+        if (S.predict) Predict.resolve("skip");
+      }
+    }
+    meP.playedAttackThisTurn = false;
+    meP.destroyReveal = false; // drop any un-used Destroy-Card reveal
+    if (oppP.counterTurns > 0) oppP.counterTurns--; // the opponent's Counter counts down over YOUR turn
+    if (oppP.spyTurns > 0) oppP.spyTurns--; // a Spy YOU placed on them ticks over YOUR turn ("ends with you")
+    log(`${side === "me" ? "Player 1 ends" : "Player 2 ends"} their turn.`);
+    S.turn = opp;
+    if (opp === S.first) {
+      // a new round begins when control returns to the player who went first
+      S.round++;
+      expireAwakening();
+    }
+    if (pvpResolveOver()) return;
+    pvpStartTurn(opp);
+  }
+
+  /* --- side-aware buys / prediction / vault (the acting side is always S.turn) --- */
+  function pvpBuyCard(side, i) {
+    const p = pvpSide(side);
+    const offer = S.cardOffers[i];
+    if (!offer || offer.sold) return;
+    const c = CARDS[offer.id];
+    if (p.hand.length >= 7 || p.gold < c.price) return;
+    p.gold -= c.price;
+    offer.sold = true;
+    p.hand.push({ uid: uidCounter++, id: offer.id });
+    // generic on purpose — naming the bought card in the SHARED log would leak a hidden hand card to the opponent
+    log(`${side === "me" ? "Player 1" : "Player 2"} buys a card from the stall.`);
+  }
+  // the effect of a shop advantage, side-aware. Returns false (no charge), true (done), or "deferred"
+  // (charged, but awaiting a follow-up action — Destroy Card's pick).
+  function pvpItemEffect(side, p, opp, itemId, arg) {
+    switch (itemId) {
+      case "spy":
+        opp.spyTurns = 3;
+        return true;
+      case "vaultsense":
+        if (p.vaultSense) return false;
+        p.vaultSense = true;
+        return true;
+      case "mirror": {
+        const lastId = side === "me" ? S.aiLastCard : S.meLastCard; // copy the OPPONENT's last-played card
+        if (!lastId || p.mirrorCharges <= 0 || p.hand.length >= HAND_MAX_MIRROR) return false;
+        p.hand.push({ uid: uidCounter++, id: lastId });
+        p.mirrorCharges--;
+        return true;
+      }
+      case "cancelawaken":
+        if (opp.awakenAt === null || opp.awakenSpent) return false;
+        opp.awakenAt = null;
+        opp.awakenSpent = false;
+        log(`${side === "me" ? "Player 1" : "Player 2"} <b>cancels</b> the enemy Awakening.`);
+        return true;
+      case "awaken":
+        if (p.awakenAt !== null && !p.awakenSpent) return false;
+        p.awakenAt = S.round;
+        p.awakenSpent = false;
+        return true;
+      case "destroycard":
+        if (p.destroyCd > 0 || !opp.hand.length) return false;
+        p.destroyReveal = true; // reveal the opponent's hand to you; the pick is a follow-up action
+        return "deferred";
+      case "swap": {
+        // buyer discards a chosen card from their OWN hand (already visible to them) and draws 2
+        if (!p.hand.length) return false;
+        const idx = p.hand.findIndex((x) => x.uid === arg);
+        if (idx < 0) return false;
+        p.hand.splice(idx, 1);
+        drawInto(p);
+        drawInto(p);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+  function pvpBuyItem(side, itemId, arg) {
+    const p = pvpSide(side),
+      opp = pvpSide(PVP_OPP[side]);
+    const it = SHOP.find((x) => x.id === itemId);
+    if (!it || p.gold < it.cost) return;
+    if (shopLocked(p) || p.noShopR > 0) return; // shop denied (enemy Shop Lock / own Vault restriction)
+    const ok = pvpItemEffect(side, p, opp, itemId, arg);
+    if (ok === false) return; // couldn't apply — no charge
+    p.gold -= it.cost;
+    // generic — which advantage was bought can be a tell (e.g. Vault Sense implies a Vault read); public effects
+    // (e.g. Cancel Awakening) log their own line inside pvpItemEffect.
+    if (ok !== "deferred") log(`${side === "me" ? "Player 1" : "Player 2"} buys an advantage.`);
+  }
+  function pvpDestroyPick(side, uid) {
+    const p = pvpSide(side),
+      opp = pvpSide(PVP_OPP[side]);
+    if (!p.destroyReveal) return; // not mid-Destroy
+    const idx = opp.hand.findIndex((x) => x.uid === uid);
+    if (idx >= 0) {
+      opp.hand.splice(idx, 1);
+      p.destroyCd = DESTROY_CD;
+      log(`${side === "me" ? "Player 1 destroys" : "Player 2 destroys"} one of the enemy's cards.`);
+    }
+    p.destroyReveal = false;
+  }
+  function pvpPlacePrediction(side, type, bet) {
+    const p = pvpSide(side);
+    if (!Object.hasOwn(PRED_TYPES, type)) return; // own-property only — a crafted 'toString'/'constructor' must not pass
+    const cur = side === "me" ? S.predict : S.aiPredict;
+    if (cur) return; // one active bet at a time
+    const ready = side === "me" ? S.predictReadyRound : S.aiPredictReadyRound;
+    if (S.round < ready) return; // on cooldown
+    bet = Math.floor(bet) || 0;
+    if (bet < PRED_MIN || bet > p.gold) return;
+    p.gold -= bet;
+    if (side === "me") {
+      S.predict = { type, bet };
+      S.predictReadyRound = S.round + PRED_CD;
+    } else {
+      S.aiPredict = { type, bet };
+      S.aiPredictReadyRound = S.round + PRED_CD;
+    }
+    // SILENT — nothing goes to the shared log while a bet is pending (no hidden-info leak).
+  }
+  function pvpVaultStash(side, a) {
+    const p = pvpSide(side);
+    if (p.vault.length >= VAULT_MAX) return;
+    const idx = p.hand.findIndex((x) => x.uid === a.uid);
+    if (idx < 0 || CARDS[p.hand[idx].id].type === "passive") return; // passives can't be vaulted
+    const startingNew = p.vault.length === 0 && !p.vaultRound;
+    let round = p.vaultRound;
+    if (startingNew) {
+      const min = S.round + 3; // earliest unleash is 3 rounds out (matches offline)
+      round = Math.max(min, a.declareRound || min);
+    }
+    // pay the stash cost: 'gold' | 'sacrifice' (destroy a chosen OTHER card) | a self-restriction kind
+    const cost = a.cost;
+    if (cost === "gold") {
+      if (p.gold < VAULT_GOLD_COST) return;
+      p.gold -= VAULT_GOLD_COST;
+    } else if (cost === "sacrifice") {
+      const sIdx = p.hand.findIndex((x) => x.uid === a.sacUid && x.uid !== a.uid);
+      if (sIdx < 0) return; // must name a different card to destroy
+      p.hand.splice(sIdx, 1);
+    } else if (Object.hasOwn(VAULT_RESTRICTIONS, cost)) {
+      // own-property only — a crafted cost:'hasOwnProperty' must NOT count as a free stash
+      const r = VAULT_RESTRICTIONS[cost];
+      p[r.field] = r.rounds;
+    } else {
+      return; // invalid cost choice
+    }
+    const i2 = p.hand.findIndex((x) => x.uid === a.uid); // re-find (sacrifice may have shifted the array)
+    if (i2 < 0) return;
+    const stashed = p.hand.splice(i2, 1)[0];
+    p.vault.push(stashed);
+    if (startingNew) p.vaultRound = round;
+    // SILENT in the shared log — the Vault is hidden info (only Vault Sense reveals a COUNT). Even announcing
+    // "a card was vaulted" is a tell; the acting client shows its own private confirmation instead.
+  }
+  // PvP action router — the server calls applyAction, which lands here when state.mode === 'pvp'.
+  function dispatchPvp(a) {
+    if (!a || !a.type) return;
+    if (a.type === "begin") {
+      if (S.turn) return; // already begun — never re-deal a live match (server also whitelists 'begin' out of actions)
+      pvpBegin(a.first);
+      return;
+    }
+    if (S.over) return; // match decided — reject everything else
+    // the acting side is derived from the authenticated seat (server sets a.by); default to the side on turn
+    const side = a.by === "ai" || a.by === "me" ? a.by : S.turn;
+    if (side !== S.turn) return; // may only act on your own turn
+    switch (a.type) {
+      case "playCard": {
+        const i = pvpSide(side).hand.findIndex((c) => c.uid === a.uid);
+        if (i >= 0) playCard(side, i);
+        break;
+      }
+      case "endTurn":
+        pvpEndTurn(side, false);
+        break;
+      case "buyCard":
+        pvpBuyCard(side, a.index);
+        break;
+      case "buyItem":
+        pvpBuyItem(side, a.itemId, a.uid);
+        break;
+      case "destroyPick":
+        pvpDestroyPick(side, a.uid);
+        break;
+      case "placePrediction":
+        pvpPlacePrediction(side, a.predictType, a.bet);
+        break;
+      case "vaultStash":
+        pvpVaultStash(side, a);
+        break;
+      default:
+        break;
+    }
+    pvpResolveOver(); // stamp the winner seat if this action ended the match
+  }
+
   /* ============================================================
    LOGIC LAYER — ACTION DISPATCH (the server-authority seam)
    applyAction(state, action) applies ONE action to a match state and returns it. The UI translates a
@@ -7063,6 +7372,7 @@
   }
   function dispatchAction(a) {
     if (!a || !a.type) return;
+    if (S.mode === "pvp") return dispatchPvp(a); // two-human server flow (never invokes the AI)
     switch (a.type) {
       case "guess":
         Game.guess(a.pick);
@@ -7093,6 +7403,103 @@
       default:
         break;
     }
+  }
+
+  /* ============================================================
+     ONLINE — hidden-information REDACTION (Phase 2, server-authority groundwork).
+     redactView(state, seat) returns the ONLY thing a given player is allowed to see. The server
+     will send THIS to each player — never the raw match state — so a player can't read the
+     opponent's secrets from the database row or from network traffic. It:
+       • puts the requester's own side as "me" (full) and the opponent as "ai" (redacted), swapping
+         perspective for p2 so each client always renders itself at the bottom;
+       • replaces the opponent's hand with face-down backs (keeping only uids + count), UNLESS the
+         requester is currently Spying them or has Peeked a specific card;
+       • strips the opponent's Vault CONTENTS and committed unleash ROUND (only a count, and only if
+         the requester bought Vault Sense);
+       • sends the deck as a count + the face-up top card only (never the hidden draw order);
+       • includes the requester's OWN pending prediction but NEVER the opponent's (the silence rule);
+       • omits the who-goes-first `secret`, `aiMood`, and the AI-read fields (playerHist/buys/predicts).
+     seat: 'p1' (this player == state.me) or 'p2' (this player == state.ai).
+     ============================================================ */
+  function redactView(state, seat) {
+    const p1 = seat !== "p2";
+    const meFull = p1 ? state.me : state.ai;
+    const oppFull = p1 ? state.ai : state.me;
+    const myTurnSeat = state.turn === "me" ? "p1" : "p2";
+    const myPredict = p1 ? state.predict : state.aiPredict;
+    const myPredictCd = p1 ? state.predictReadyRound : state.aiPredictReadyRound;
+    const clone = (o) => JSON.parse(JSON.stringify(o == null ? null : o));
+    // opponent hand: only revealed if you're Spying them, a specific card was Peeked, or you're mid-Destroy-Card
+    // (which shows the enemy hand so you can pick a card to destroy); else a face-down back.
+    const spying = oppFull.spyTurns > 0 || !!meFull.destroyReveal;
+    const peeked = oppFull.peeked || [];
+    // a hidden card is JUST a back — no uid — so its monotonic uid can't leak the opponent's draw order/age.
+    // (revealed cards keep uid+id because the client needs the uid to target them, e.g. Destroy-Card's pick.)
+    const oppHand = (oppFull.hand || []).map((c) =>
+      spying || peeked.includes(c.uid) ? { uid: c.uid, id: c.id } : { back: true },
+    );
+    const opp = clone(oppFull); // keep public stuff (hp/shield/gold/passives/statuses), strip secrets
+    opp.hand = oppHand;
+    opp.vault = []; // never send the opponent's stashed cards
+    opp.vaultRound = 0; // never send their committed unleash round
+    opp.vaultCount = meFull.vaultSense ? (oppFull.vault || []).length : null; // count only with Vault Sense
+    opp.vaultSense = false; // whether THEY bought Vault Sense is a hidden tell — never reveal it
+    return {
+      seat,
+      round: state.round,
+      turn: myTurnSeat === seat ? "me" : "ai",
+      over: !!state.over,
+      winnerSeat: state.winnerSeat || null,
+      timeLeft: state.timeLeft,
+      me: clone(meFull), // your own full side
+      ai: opp, // the opponent, redacted
+      predict: myPredict ? clone(myPredict) : null, // YOUR pending bet (silent to the opponent)
+      predictReadyRound: myPredictCd || 0,
+      pending: meFull.destroyReveal ? "destroy" : null, // client cue: you owe a Destroy-Card pick
+      deck: {
+        count: (state.deck || []).length,
+        top: state.deck && state.deck[0] ? { id: state.deck[0].id } : null,
+      },
+      // stats are tracked for side 'me' only, so they belong to p1 — never hand p2 p1's damage/gold totals
+      stats: p1 ? clone(state.stats || {}) : {},
+    };
+  }
+
+  /* Seed the new-card uid counter from a loaded state so the SERVER never mints a uid that collides with a card
+     already in the match. Each server cold-start reloads the engine and resets uidCounter to 1; the referee MUST
+     call this right after loading a match state and before applyAction. (Offline never calls it — a single page
+     session keeps uidCounter monotonic on its own, and reseeding lower there could actually cause collisions.) */
+  function seedUids(state) {
+    if (!state) return uidCounter;
+    let max = 0;
+    const scan = (arr) => {
+      if (Array.isArray(arr))
+        for (const c of arr) if (c && c.uid > max) max = c.uid;
+    };
+    scan(state.deck);
+    if (state.me) {
+      scan(state.me.hand);
+      scan(state.me.vault);
+    }
+    if (state.ai) {
+      scan(state.ai.hand);
+      scan(state.ai.vault);
+    }
+    uidCounter = max + 1;
+    return uidCounter;
+  }
+
+  /* Engine surface — the SAME rules the client runs become the server's authority (imported by the
+     Supabase Edge Function). Exposed on globalThis; harmless in the browser. */
+  if (typeof globalThis !== "undefined") {
+    globalThis.ShinruEngine = {
+      newMatch,
+      applyAction,
+      redactView,
+      seedUids,
+      CARDS: typeof CARDS !== "undefined" ? CARDS : null,
+      VERSION: "phase2-pvp-engine",
+    };
   }
 
   /* ============================================================
@@ -7370,10 +7777,12 @@
     return `<div class="card ${c.type}">${cardInner(c)}</div>`;
   }
 
-  /* ---- track AI last card for Mirror ---- */
+  /* ---- track each side's last-played card for Mirror (S.aiLastCard = offline player's Mirror source;
+     S.meLastCard added so PvP player 2 can Mirror player 1) ---- */
   const _origApply = applyEffect;
   applyEffect = function (c, id, p, opp, who) {
     if (who === "ai") S.aiLastCard = id;
+    else S.meLastCard = id;
     return _origApply(c, id, p, opp, who);
   };
 
