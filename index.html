@@ -4172,7 +4172,7 @@
     <div class="hitflash" id="aiFlash"></div>
     <div class="fxlayer" id="fxAi"></div>
     <div class="nameplate">
-      <span class="badge ai">AI · Red</span>
+      <span class="badge ai" id="aiBadge">AI · Red</span>
       <div class="hpwrap">
         <div class="hpbar"><div class="hpfill" id="aiHp"></div></div>
         <div class="hptext">
@@ -4182,7 +4182,7 @@
       <span class="stat">Gold <b id="aiGold">0</b></span>
       <span class="stat" id="aiStatus"></span>
     </div>
-    <p class="zone-label">AI hand · <span id="aiHandCount">0</span> cards</p>
+    <p class="zone-label"><span id="aiHandLabel">AI</span> hand · <span id="aiHandCount">0</span> cards</p>
     <div class="aihand" id="aiHand"></div>
     <div class="passives" id="aiPassives"></div>
   </div>
@@ -7686,7 +7686,17 @@
       ? "⏸ Paused"
       : S.turn === "me"
         ? "Your turn"
-        : "AI turn";
+        : S.mode === "online"
+          ? "Opponent's turn"
+          : "AI turn";
+    // online: the opponent is the OTHER human, not the AI — relabel the nameplate + hand zone
+    if (S.mode === "online") {
+      const oppName = typeof Online !== "undefined" && Online.seat === "p1" ? "Player 2" : "Player 1";
+      const bd = document.getElementById("aiBadge");
+      if (bd) bd.textContent = oppName + " · Red";
+      const hl = document.getElementById("aiHandLabel");
+      if (hl) hl.textContent = oppName + "'s";
+    }
     document.getElementById("endBtn").disabled =
       S.turn !== "me" || S.paused || S.animating || S.over;
 
@@ -9070,6 +9080,7 @@ break a condition. Knowledge is the balance.</p>`;
     inBoard: false,
     overShown: false,
     prevTurn: null,
+    _pollT: null,
 
     on() {
       return !!(S && S.mode === "online");
@@ -9133,6 +9144,7 @@ break a condition. Knowledge is the balance.</p>`;
       this.matchId = res.body.matchId;
       this.code = res.body.code;
       this.subscribe();
+      this._startPoll(); // guarantees the transition to the board when the opponent joins
       this._showWaiting(this.code);
     },
     async join() {
@@ -9149,12 +9161,25 @@ break a condition. Knowledge is the balance.</p>`;
       }
       this.matchId = res.body.matchId;
       this.subscribe();
+      this._startPoll();
       await this.fetchView(); // joining already dealt + started the match
     },
 
-    subscribe() {
+    async subscribe() {
       if (!sb || this.channel || !this.matchId) return;
       try {
+        // Realtime postgres_changes respects RLS, so the socket MUST carry the user's JWT — otherwise the creator
+        // is treated as anon and never receives the "Player 2 joined" UPDATE. (The poll below is the guarantee.)
+        let token = null;
+        try {
+          const s = await sb.auth.getSession();
+          token = s && s.data && s.data.session ? s.data.session.access_token : null;
+        } catch (e) {}
+        if (token && sb.realtime && sb.realtime.setAuth) {
+          try {
+            sb.realtime.setAuth(token);
+          } catch (e) {}
+        }
         this.channel = sb
           .channel("shinru-match-" + this.matchId)
           .on(
@@ -9164,6 +9189,31 @@ break a condition. Knowledge is the balance.</p>`;
           )
           .subscribe();
       } catch (e) {}
+    },
+    // RELIABLE FALLBACK: poll the (RLS-readable) matches row for status/version. This GUARANTEES the creator
+    // transitions when the opponent joins and catches any Realtime update the socket misses. Realtime is the fast
+    // path; this is the safety net (2s while waiting, 4s in-match). Reads matches directly — no Edge Function call.
+    _startPoll() {
+      this._stopPoll();
+      const tick = async () => {
+        this._pollT = null;
+        if (!this.matchId) return;
+        try {
+          const q = await sb.from("matches").select("status,version").eq("id", this.matchId).maybeSingle();
+          const row = q && q.data;
+          if (row && row.status === "active" && (!this.inBoard || (row.version || 0) > this.version)) {
+            await this.fetchView();
+          }
+        } catch (e) {}
+        if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
+      };
+      this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
+    },
+    _stopPoll() {
+      if (this._pollT) {
+        clearTimeout(this._pollT);
+        this._pollT = null;
+      }
     },
     async fetchView() {
       if (!this.matchId) return;
@@ -9275,6 +9325,7 @@ break a condition. Knowledge is the balance.</p>`;
     // Full teardown — MUST run on any exit from an online match (menu, play-again, opening the lobby) so the
     // Realtime channel is removed and matchId is nulled. Otherwise a late nudge could fetch + clobber an offline S.
     leave() {
+      this._stopPoll();
       if (this.channel && sb) {
         try {
           sb.removeChannel(this.channel);
