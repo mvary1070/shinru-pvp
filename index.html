@@ -9195,27 +9195,49 @@ break a condition. Knowledge is the balance.</p>`;
     // RELIABLE FALLBACK: poll the (RLS-readable) matches row for status/version. This GUARANTEES the creator
     // transitions when the opponent joins and catches any Realtime update the socket misses. Realtime is the fast
     // path; this is the safety net (2s while waiting, 4s in-match). Reads matches directly — no Edge Function call.
+    // Poll via the Edge Function `view` op (authenticated with the Bearer token — reliable) rather than a direct
+    // client RLS read of the matches row, which can silently return nothing if the session token isn't attached to
+    // PostgREST/Realtime (the likely reason the creator never transitioned). While WAITING, enter the board the
+    // moment status flips to 'active'; in-match, a version bump is a safety net for a live update Realtime missed.
     _startPoll() {
       this._stopPoll();
+      this._pollN = 0;
       const tick = async () => {
         this._pollT = null;
         if (!this.matchId) return;
-        try {
-          const q = await sb.from("matches").select("status,version").eq("id", this.matchId).maybeSingle();
-          const row = q && q.data;
-          if (row && row.status === "active" && (!this.inBoard || (row.version || 0) > this.version)) {
-            await this.fetchView();
+        this._pollN++;
+        const res = await this._post({ op: "view", matchId: this.matchId });
+        const st = res.body && res.body.status;
+        if (!this.inBoard)
+          this._dbg(
+            "checking for opponent… (#" + this._pollN + ": http " + res.status +
+              (st ? " · match " + st : "") +
+              (res.body && res.body.error ? " · " + res.body.error : "") + ")",
+          );
+        if (res.status < 400 && res.body && res.body.me) {
+          if (!this.inBoard && st === "active") {
+            this.applyView(res.body); // opponent joined → enter the board
+          } else if (this.inBoard && typeof res.body.version === "number" && res.body.version > this.version) {
+            this.applyView(res.body); // caught a live update Realtime may have missed
           }
-        } catch (e) {}
+        }
         if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
       };
-      this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
+      this._pollT = setTimeout(tick, 1200);
     },
     _stopPoll() {
       if (this._pollT) {
         clearTimeout(this._pollT);
         this._pollT = null;
       }
+    },
+    // visible debug (temporary): console + the waiting-screen message so we can SEE the poll running + status read
+    _dbg(msg) {
+      try {
+        console.log("[shinru online] " + msg);
+      } catch (e) {}
+      const m = document.getElementById("onlineMsg");
+      if (m && !this.inBoard) m.textContent = msg;
     },
     async fetchView() {
       if (!this.matchId) return;
