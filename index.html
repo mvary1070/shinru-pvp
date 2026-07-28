@@ -3921,7 +3921,7 @@
     >
       🛠 SANDBOX (real match + tools + pause)
     </button>
-    <button class="ss-disabled" disabled>ONLINE 1V1 <i>coming soon</i></button>
+    <button class="ss-primary" onclick="Online.openLobby()">ONLINE 1V1</button>
     <div class="ss-secondrow">
       <button class="ss-ghost" onclick="Menu.open('loadoutModal')">
         LOADOUT
@@ -4013,6 +4013,68 @@
       ><button class="btn ghost" onclick="Menu.close('settingsModal')">
         Done
       </button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== ONLINE 1V1 LOBBY (Phase 2) ===================== -->
+<div id="onlineModal" class="modal hide">
+  <div class="sheet">
+    <h2 style="font-family: 'Cinzel', serif">⚔ Online 1v1</h2>
+    <div id="onlineForms">
+      <div class="sub">
+        Create a match and share the code with a friend, or enter their code to join. Both of you must be
+        logged in. (The offline "Play vs AI" game is always available without any of this.)
+      </div>
+      <button
+        class="btn"
+        style="width: 100%; margin-top: 14px"
+        onclick="Online.create()"
+      >
+        Create a match
+      </button>
+      <div style="display: flex; gap: 8px; margin-top: 12px">
+        <input
+          id="joinCode"
+          maxlength="8"
+          placeholder="ENTER CODE"
+          autocomplete="off"
+          spellcheck="false"
+          style="
+            flex: 1;
+            padding: 12px;
+            font-family: 'Cinzel', serif;
+            font-size: 16px;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+            text-align: center;
+            background: rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(240, 214, 138, 0.4);
+            border-radius: 8px;
+            color: #f0d68a;
+          "
+        />
+        <button class="btn" onclick="Online.join()">Join</button>
+      </div>
+    </div>
+    <div id="onlineWait" class="hide">
+      <div class="sub">Share this code with your opponent:</div>
+      <div
+        id="waitCode"
+        style="
+          font-family: 'Cinzel', serif;
+          font-size: 34px;
+          letter-spacing: 6px;
+          text-align: center;
+          color: #f0d68a;
+          margin: 14px 0;
+        "
+      ></div>
+      <div class="sub">Waiting for them to join…</div>
+    </div>
+    <div id="onlineMsg" class="sub err" style="min-height: 1.2em; margin-top: 10px"></div>
+    <div style="text-align: right; margin-top: 14px">
+      <button class="btn ghost" onclick="Online.closeLobby()">Close</button>
     </div>
   </div>
 </div>
@@ -4142,7 +4204,7 @@
       <button
         class="btn endbtn"
         id="endBtn"
-        onclick="applyAction({ type: 'endTurn' })"
+        onclick="clientAct({ type: 'endTurn' })"
       >
         End Turn
       </button>
@@ -5131,11 +5193,13 @@
 
     // end-screen actions
     playAgain() {
+      Online.leave(); // leaving any online match → drop its Realtime channel before starting a fresh (offline) match
       const sb = !!(S && S.sandbox);
       show("overScreen", false);
       sb ? this.startSandbox() : this.toFirstPick();
     },
     toMenu() {
+      Online.leave(); // ditto — never leave an online channel live behind an offline/menu screen
       show("overScreen", false);
       show("board", false);
       show("log", false);
@@ -6371,6 +6435,10 @@
       document.getElementById("shopPanel").classList.add("open");
     },
     buyCard(i) {
+      if (Online.on()) {
+        clientAct({ type: "buyCard", index: i });
+        return;
+      }
       const offer = S.cardOffers[i];
       if (!offer || offer.sold) return;
       const c = CARDS[offer.id];
@@ -6394,6 +6462,10 @@
       Shop.render();
     },
     buy(it) {
+      if (Online.on()) {
+        Online.buyItem(it);
+        return;
+      }
       if (S.me.gold < it.cost) {
         toast("Not enough gold.");
         FX.sfxDenied();
@@ -6512,6 +6584,11 @@
       }
       if (bet > S.me.gold) {
         toast("You don't have that much gold.");
+        return;
+      }
+      if (Online.on()) {
+        clientAct({ type: "placePrediction", predictType: this.selType, bet });
+        this.close();
         return;
       }
       this.place(this.selType, bet);
@@ -6738,7 +6815,27 @@
       this.pendingIdx = null;
       show("vaultCostModal", false);
     },
+    // ONLINE: the whole stash flow (declare round → pick card → choose cost) collects into ONE server action
+    _emitStash(cost, sacUid) {
+      const inst = S.me.hand[this.pendingIdx];
+      show("vaultCostModal", false);
+      if (!inst) {
+        this.pendingIdx = null;
+        this.pendingRound = null;
+        return;
+      }
+      const a = { type: "vaultStash", uid: inst.uid, cost };
+      if (this.pendingRound) a.declareRound = this.pendingRound; // only when starting a fresh Vault
+      if (sacUid) a.sacUid = sacUid;
+      this.pendingIdx = null;
+      this.pendingRound = null;
+      clientAct(a);
+    },
     payGold() {
+      if (Online.on()) {
+        this._emitStash("gold");
+        return;
+      }
       if (S.me.gold < VAULT_GOLD_COST) {
         toast("Not enough gold.");
         return;
@@ -6747,6 +6844,10 @@
       this.finalize();
     },
     restrict(kind) {
+      if (Online.on()) {
+        this._emitStash(kind);
+        return;
+      }
       const r = VAULT_RESTRICTIONS[kind];
       S.me[r.field] = r.rounds;
       toast("Restriction accepted — " + r.label);
@@ -6767,6 +6868,10 @@
         "This card is destroyed to pay for vaulting your chosen card.",
         others.map((x) => x.inst),
         (k) => {
+          if (Online.on()) {
+            this._emitStash("sacrifice", others[k].inst.uid);
+            return;
+          }
           const destroyIdx = others[k].i;
           S.me.hand.splice(destroyIdx, 1);
           if (destroyIdx < this.pendingIdx) this.pendingIdx--; // our card shifted left
@@ -7460,6 +7565,11 @@
         count: (state.deck || []).length,
         top: state.deck && state.deck[0] ? { id: state.deck[0].id } : null,
       },
+      // UI-only, non-secret extras: your shop stall (ONLY on your turn, so your offers don't leak to the opponent),
+      // how many plays you've used this turn, and the opponent's last PLAYED card id (public) so Mirror works online.
+      cardOffers: myTurnSeat === seat ? clone(state.cardOffers || []) : [],
+      cardsPlayed: state.cardsPlayed || 0,
+      oppLastCard: (p1 ? state.aiLastCard : state.meLastCard) || null,
       // stats are tracked for side 'me' only, so they belong to p1 — never hand p2 p1's damage/gold totals
       stats: p1 ? clone(state.stats || {}) : {},
     };
@@ -7607,8 +7717,7 @@
       el.className = "card " + c.type + (canPlay ? " play" : "");
       el.innerHTML = cardInner(c);
       if (canPlay)
-        el.onclick = () =>
-          applyAction({ type: "playCard", by: "me", uid: inst.uid }); // input → action → logic
+        el.onclick = () => clientAct({ type: "playCard", by: "me", uid: inst.uid }); // → local logic (offline) / server (online)
       mh.appendChild(el);
     });
 
@@ -7620,7 +7729,9 @@
     ai.hand.forEach((inst) => {
       const c = CARDS[inst.id];
       const el = document.createElement("div");
-      const shown = spyOn || ai.peeked.includes(inst.uid);
+      // online: the redacted view already decided reveals (spy OR mid-Destroy) — a revealed card carries an id
+      const shown =
+        spyOn || ai.peeked.includes(inst.uid) || (S.mode === "online" && inst.id !== undefined);
       if (shown) {
         el.className = "card " + c.type + (!spyOn ? " peeked" : "");
         el.innerHTML = cardInner(c);
@@ -8875,6 +8986,322 @@ break a condition. Knowledge is the balance.</p>`;
       if (/network|fetch|failed to fetch/i.test(m))
         return "Network error — check your connection.";
       return m || "Something went wrong — try again.";
+    },
+  };
+
+  /* ============================================================
+   ONLINE 1v1 (Phase 2) — client wiring to the `match` Edge Function.
+   The server is the referee: this client NEVER runs the rules for an online match. It sends ACTIONS and
+   renders the per-player REDACTED VIEW the server returns / it fetches on a Realtime nudge. The offline
+   vs-AI game is untouched — every online path is gated by S.mode === 'online' (Online.on()).
+   ============================================================ */
+
+  // The one action choke point. Offline: apply locally (self-renders). Online: submit to the server.
+  function clientAct(a) {
+    if (S && S.mode === "online") {
+      Online.act(a);
+      return;
+    }
+    applyAction(a);
+  }
+
+  // Adapt a redacted server view into an S-shaped object the existing render()/Shop/Predict/Vault can draw.
+  function onlineViewToState(view) {
+    const s = {
+      mode: "online",
+      seat: view.seat,
+      round: view.round,
+      turn: view.turn, // 'me' | 'ai' (viewer perspective)
+      over: !!view.over,
+      winnerSeat: view.winnerSeat || null,
+      timeLeft: view.timeLeft || 0,
+      me: view.me,
+      ai: view.ai,
+      predict: view.predict || null,
+      predictReadyRound: view.predictReadyRound || 0,
+      aiPredict: null,
+      aiPredictReadyRound: 0, // opponent's bet is never known
+      pending: view.pending || null,
+      cardsPlayed: view.cardsPlayed || 0,
+      cardOffers: view.cardOffers || [],
+      stats: Object.assign(
+        { dmgDealt: 0, biggestHit: 0, goldEarned: 0 },
+        view.stats || {},
+      ),
+      aiLastCard: view.oppLastCard || null,
+      meLastCard: null,
+      // UI-local flags that don't come from the server
+      paused: false,
+      animating: false,
+      sandbox: false,
+      revealAll: false,
+      roleSwap: false,
+      roleSwapUsed: false,
+      first: null,
+      secret: null,
+      aiMood: null,
+      playerHist: {},
+      playerBuys: 0,
+      playerPredicts: 0,
+      log: [], // local battle feed (the shared server log is never sent — Online.applyView preserves this across views)
+      version: typeof view.version === "number" ? view.version : 0,
+    };
+    // render() reads S.deck.length and S.deck[0].id — rebuild a length-accurate array with the face-up top at [0]
+    const n = (view.deck && view.deck.count) || 0;
+    s.deck = new Array(Math.max(0, n));
+    if (n > 0 && view.deck && view.deck.top) s.deck[0] = { id: view.deck.top.id, uid: 0 };
+    // opponent Vault: Vault.render shows the enemy count (only with Vault Sense) from S.ai.vault.length
+    if (s.ai) {
+      s.ai.vault = view.ai && view.ai.vaultCount != null ? new Array(view.ai.vaultCount) : [];
+      s.ai.vaultRound = 0;
+      if (!Array.isArray(s.ai.peeked)) s.ai.peeked = [];
+    }
+    if (s.me && !Array.isArray(s.me.peeked)) s.me.peeked = [];
+    return s;
+  }
+
+  const Online = {
+    matchId: null,
+    code: null,
+    seat: null,
+    version: 0,
+    channel: null,
+    busy: false,
+    inBoard: false,
+    overShown: false,
+    prevTurn: null,
+
+    on() {
+      return !!(S && S.mode === "online");
+    },
+    url() {
+      return (SUPABASE_URL || "") + "/functions/v1/match";
+    },
+    configured() {
+      return !!(SUPABASE_URL && sb && typeof Auth !== "undefined" && Auth.mode === "online");
+    },
+
+    openLobby() {
+      if (!this.configured()) {
+        toast("Log in to play online.");
+        if (typeof Auth !== "undefined" && Auth.showAuth) Auth.showAuth();
+        return;
+      }
+      this.leave(); // tear down any prior match + Realtime channel so a fresh lobby starts clean
+      this._msg("");
+      document.getElementById("onlineWait").classList.add("hide");
+      document.getElementById("onlineForms").classList.remove("hide");
+      const jc = document.getElementById("joinCode");
+      if (jc) jc.value = "";
+      show("onlineModal", true);
+    },
+    closeLobby() {
+      show("onlineModal", false);
+    },
+
+    async _post(body) {
+      let token = null;
+      try {
+        const s = await sb.auth.getSession();
+        token = s && s.data && s.data.session ? s.data.session.access_token : null;
+      } catch (e) {}
+      if (!token) return { status: 401, body: { error: "not logged in" } };
+      let r;
+      try {
+        r = await fetch(this.url(), {
+          method: "POST",
+          headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch (e) {
+        return { status: 0, body: { error: "network" } };
+      }
+      let j = {};
+      try {
+        j = await r.json();
+      } catch (e) {}
+      return { status: r.status, body: j || {} };
+    },
+
+    async create() {
+      this._msg("Creating match…");
+      const res = await this._post({ op: "create" });
+      if (res.status >= 400) {
+        this._msg(res.body.error || "Could not create match.", true);
+        return;
+      }
+      this.matchId = res.body.matchId;
+      this.code = res.body.code;
+      this.subscribe();
+      this._showWaiting(this.code);
+    },
+    async join() {
+      const code = ((document.getElementById("joinCode") || {}).value || "").trim().toUpperCase();
+      if (!code) {
+        this._msg("Enter a match code.", true);
+        return;
+      }
+      this._msg("Joining…");
+      const res = await this._post({ op: "join", code });
+      if (res.status >= 400) {
+        this._msg("Couldn't join — check the code (or the match is full).", true);
+        return;
+      }
+      this.matchId = res.body.matchId;
+      this.subscribe();
+      await this.fetchView(); // joining already dealt + started the match
+    },
+
+    subscribe() {
+      if (!sb || this.channel || !this.matchId) return;
+      try {
+        this.channel = sb
+          .channel("shinru-match-" + this.matchId)
+          .on(
+            "postgres_changes",
+            { event: "UPDATE", schema: "public", table: "matches", filter: "id=eq." + this.matchId },
+            () => this.fetchView(),
+          )
+          .subscribe();
+      } catch (e) {}
+    },
+    async fetchView() {
+      if (!this.matchId) return;
+      const res = await this._post({ op: "view", matchId: this.matchId });
+      if (res.status >= 400) return;
+      this.applyView(res.body);
+    },
+
+    async act(action) {
+      if (this.busy || !this.matchId) return;
+      this.busy = true;
+      try {
+        const res = await this._post({
+          op: "action",
+          matchId: this.matchId,
+          action,
+          expectedVersion: this.version,
+        });
+        if (!res.status) {
+          toast("Network error — try again."); // transport failure (_post returned status 0) — never a silent no-op
+        } else if (res.status === 409) {
+          if (res.body && res.body.me) this.applyView(res.body);
+          toast("Re-synced — try that again.");
+        } else if (res.status >= 400) {
+          toast(this._friendly(res.body && res.body.error));
+        } else {
+          this.applyView(res.body);
+        }
+      } finally {
+        this.busy = false;
+      }
+    },
+
+    applyView(view) {
+      if (!this.matchId) return; // a nudge arriving after we left the match — ignore (never clobber an offline S)
+      if (!view || !view.me) return; // waiting/not-started view → ignore until the match begins
+      this.version = typeof view.version === "number" ? view.version : this.version;
+      this.seat = view.seat;
+      const prevLog = this.inBoard && S && Array.isArray(S.log) ? S.log : []; // keep the local feed across updates
+      S = onlineViewToState(view);
+      S.log = prevLog;
+      if (!this.inBoard) this._enterBoard();
+      // local turn-change feedback (the shared server log isn't sent, to avoid leaks)
+      if (this.prevTurn !== null && view.turn !== this.prevTurn && !view.over) {
+        log(view.turn === "me" ? `<b>Your turn</b> — round ${view.round}.` : "Opponent is playing…");
+      }
+      this.prevTurn = view.turn;
+      render();
+      if (typeof Shop !== "undefined" && Shop.isOpen && Shop.isOpen()) Shop.render();
+      if (view.over) {
+        this._over(view);
+        return;
+      }
+      if (view.pending === "destroy") this._destroyPicker();
+    },
+
+    _enterBoard() {
+      this.inBoard = true;
+      show("onlineModal", false);
+      show("startScreen", false);
+      show("firstScreen", false);
+      document.body.classList.remove("sandbox");
+      show("board", true);
+      show("log", true);
+      show("sfxWrap", true);
+      log(`<b>Online match.</b> You are ${this.seat === "p1" ? "Player 1" : "Player 2"}.`);
+      FX.sfxMatchStart();
+    },
+    _showWaiting(code) {
+      document.getElementById("onlineForms").classList.add("hide");
+      document.getElementById("onlineWait").classList.remove("hide");
+      document.getElementById("waitCode").textContent = code;
+      this._msg("");
+    },
+    _over(view) {
+      if (this.overShown) return;
+      this.overShown = true;
+      const win = !!(view.winnerSeat && view.seat && view.winnerSeat === view.seat);
+      S.over = false; // over() guards on S.over — let it fire
+      over(win);
+    },
+    _destroyPicker() {
+      const hand = (S.ai.hand || []).filter((c) => c && c.id !== undefined);
+      if (!hand.length) return;
+      Pick.cards(
+        "Destroy a card",
+        "The opponent's hand — choose one to destroy.",
+        hand,
+        (k) => clientAct({ type: "destroyPick", uid: hand[k].uid }),
+        true,
+      );
+    },
+
+    // online buy routing — Card Swap needs an own-hand pick first; everything else is a single action
+    buyItem(it) {
+      if (it.id === "swap") {
+        if (!S.me.hand.length) {
+          toast("No cards to discard.");
+          return;
+        }
+        Pick.cards("Discard a card", "You'll draw 2 new ones.", S.me.hand, (i) =>
+          clientAct({ type: "buyItem", itemId: "swap", uid: S.me.hand[i].uid }),
+        );
+        return;
+      }
+      clientAct({ type: "buyItem", itemId: it.id }); // destroycard opens its picker via the returned view
+    },
+
+    // Full teardown — MUST run on any exit from an online match (menu, play-again, opening the lobby) so the
+    // Realtime channel is removed and matchId is nulled. Otherwise a late nudge could fetch + clobber an offline S.
+    leave() {
+      if (this.channel && sb) {
+        try {
+          sb.removeChannel(this.channel);
+        } catch (e) {}
+      }
+      this.channel = null;
+      this.matchId = null;
+      this.code = null;
+      this.inBoard = false;
+      this.overShown = false;
+      this.version = 0;
+      this.prevTurn = null;
+    },
+
+    _msg(t, err) {
+      const m = document.getElementById("onlineMsg");
+      if (m) {
+        m.textContent = t || "";
+        m.classList.toggle("err", !!err);
+      }
+    },
+    _friendly(e) {
+      if (!e) return "Move rejected.";
+      if (/not your turn/i.test(e)) return "It's not your turn.";
+      if (/not active|over/i.test(e)) return "The match isn't active.";
+      if (/bad action|bad request/i.test(e)) return "That move isn't allowed.";
+      return "Move rejected.";
     },
   };
 
