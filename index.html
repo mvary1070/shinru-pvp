@@ -9156,7 +9156,9 @@ break a condition. Knowledge is the balance.</p>`;
       this._msg("Joining…");
       const res = await this._post({ op: "join", code });
       if (res.status >= 400) {
-        this._msg("Couldn't join — check the code (or the match is full).", true);
+        // TEMP DEBUG: show the server's exact reason (debug/error + status) instead of a generic message.
+        const d = res.body && (res.body.debug || res.body.error);
+        this._msg("Couldn't join (" + res.status + "): " + (d ? (typeof d === "string" ? d : JSON.stringify(d)) : "unknown"), true);
         return;
       }
       this.matchId = res.body.matchId;
