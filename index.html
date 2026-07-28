@@ -9156,9 +9156,7 @@ break a condition. Knowledge is the balance.</p>`;
       this._msg("Joining…");
       const res = await this._post({ op: "join", code });
       if (res.status >= 400) {
-        // TEMP DEBUG: show the server's exact reason (debug/error + status) instead of a generic message.
-        const d = res.body && (res.body.debug || res.body.error);
-        this._msg("Couldn't join (" + res.status + "): " + (d ? (typeof d === "string" ? d : JSON.stringify(d)) : "unknown"), true);
+        this._msg("Couldn't join — check the code (or the match is full).", true);
         return;
       }
       this.matchId = res.body.matchId;
@@ -9187,9 +9185,12 @@ break a condition. Knowledge is the balance.</p>`;
           .on(
             "postgres_changes",
             { event: "UPDATE", schema: "public", table: "matches", filter: "id=eq." + this.matchId },
-            () => this.fetchView(),
+            () => {
+              this._dbg("realtime: match updated → fetch view");
+              this.fetchView(); // near-instant live push (the poll is only a fallback for missed events)
+            },
           )
-          .subscribe();
+          .subscribe((status) => this._dbg("realtime: channel " + status));
       } catch (e) {}
     },
     // RELIABLE FALLBACK: poll the (RLS-readable) matches row for status/version. This GUARANTEES the creator
@@ -9199,31 +9200,24 @@ break a condition. Knowledge is the balance.</p>`;
     // client RLS read of the matches row, which can silently return nothing if the session token isn't attached to
     // PostgREST/Realtime (the likely reason the creator never transitioned). While WAITING, enter the board the
     // moment status flips to 'active'; in-match, a version bump is a safety net for a live update Realtime missed.
+    // The Edge Function `view` op is the reliable transport (Bearer-authenticated). While WAITING, poll it every 2s
+    // to enter the board when the opponent joins. IN-MATCH, live updates arrive via Realtime (near-instant); this
+    // poll drops to a slow 6s SAFETY NET that only catches an update Realtime missed (version advanced).
     _startPoll() {
       this._stopPoll();
-      this._pollN = 0;
       const tick = async () => {
         this._pollT = null;
         if (!this.matchId) return;
-        this._pollN++;
         const res = await this._post({ op: "view", matchId: this.matchId });
         const st = res.body && res.body.status;
-        if (!this.inBoard)
-          this._dbg(
-            "checking for opponent… (#" + this._pollN + ": http " + res.status +
-              (st ? " · match " + st : "") +
-              (res.body && res.body.error ? " · " + res.body.error : "") + ")",
-          );
         if (res.status < 400 && res.body && res.body.me) {
-          if (!this.inBoard && st === "active") {
-            this.applyView(res.body); // opponent joined → enter the board
-          } else if (this.inBoard && typeof res.body.version === "number" && res.body.version > this.version) {
-            this.applyView(res.body); // caught a live update Realtime may have missed
-          }
+          if (!this.inBoard && st === "active") this.applyView(res.body); // opponent joined → enter the board
+          else if (this.inBoard && typeof res.body.version === "number" && res.body.version > this.version)
+            this.applyView(res.body); // safety net for a missed live update
         }
-        if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
+        if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 6000 : 2000);
       };
-      this._pollT = setTimeout(tick, 1200);
+      this._pollT = setTimeout(tick, 1000);
     },
     _stopPoll() {
       if (this._pollT) {
@@ -9231,13 +9225,33 @@ break a condition. Knowledge is the balance.</p>`;
         this._pollT = null;
       }
     },
-    // visible debug (temporary): console + the waiting-screen message so we can SEE the poll running + status read
+    // Local turn clock: ticks every second on each screen and re-syncs to the server's authoritative timeLeft on
+    // every view update — so it runs smoothly without waiting on the network. When it hits 0 on YOUR turn it
+    // best-effort auto-ends (the server validates it); the opponent's screen shows the same countdown but never ends.
+    _startClock() {
+      this._stopClock();
+      this._clockT = setInterval(() => {
+        if (!S || S.mode !== "online" || !this.inBoard || S.over) return;
+        if (S.timeLeft > 0) S.timeLeft--;
+        try {
+          drawClock();
+        } catch (e) {}
+        if (S.timeLeft <= 0 && S.turn === "me" && !this.busy && this._autoEndV !== this.version) {
+          this._autoEndV = this.version;
+          clientAct({ type: "endTurn" });
+        }
+      }, 1000);
+    },
+    _stopClock() {
+      if (this._clockT) {
+        clearInterval(this._clockT);
+        this._clockT = null;
+      }
+    },
     _dbg(msg) {
       try {
         console.log("[shinru online] " + msg);
       } catch (e) {}
-      const m = document.getElementById("onlineMsg");
-      if (m && !this.inBoard) m.textContent = msg;
     },
     async fetchView() {
       if (!this.matchId) return;
@@ -9276,6 +9290,7 @@ break a condition. Knowledge is the balance.</p>`;
       if (!view || !view.me) return; // waiting/not-started view → ignore until the match begins
       this.version = typeof view.version === "number" ? view.version : this.version;
       this.seat = view.seat;
+      const prevSnap = this._snap;
       const prevLog = this.inBoard && S && Array.isArray(S.log) ? S.log : []; // keep the local feed across updates
       S = onlineViewToState(view);
       S.log = prevLog;
@@ -9285,7 +9300,23 @@ break a condition. Knowledge is the balance.</p>`;
         log(view.turn === "me" ? `<b>Your turn</b> — round ${view.round}.` : "Opponent is playing…");
       }
       this.prevTurn = view.turn;
+      // AUDIO: the client doesn't run the rules (so it has no per-effect FX hooks) — approximate the sounds from the
+      // state diff since the last view: an impact on damage, a chime on heal, the turn cue when it becomes yours.
+      const snap = { meHp: view.me.hp, aiHp: view.ai.hp, turn: view.turn };
+      if (prevSnap) {
+        try {
+          const toMe = prevSnap.meHp - snap.meHp,
+            toOpp = prevSnap.aiHp - snap.aiHp;
+          if (toMe > 0 || toOpp > 0) { if (FX.sfxHitHp) FX.sfxHitHp(Math.max(toMe, toOpp)); }
+          else if (snap.meHp > prevSnap.meHp || snap.aiHp > prevSnap.aiHp) { if (FX.sfxHeal) FX.sfxHeal(); }
+          if (snap.turn === "me" && prevSnap.turn !== "me" && FX.sfxTurnStart) FX.sfxTurnStart();
+        } catch (e) {}
+      }
+      this._snap = snap;
       render();
+      try {
+        drawClock();
+      } catch (e) {} // sync the clock display to the server's authoritative timeLeft
       if (typeof Shop !== "undefined" && Shop.isOpen && Shop.isOpen()) Shop.render();
       if (view.over) {
         this._over(view);
@@ -9296,6 +9327,7 @@ break a condition. Knowledge is the balance.</p>`;
 
     _enterBoard() {
       this.inBoard = true;
+      this._snap = null; // reset the audio-diff baseline for the new match
       show("onlineModal", false);
       show("startScreen", false);
       show("firstScreen", false);
@@ -9305,6 +9337,7 @@ break a condition. Knowledge is the balance.</p>`;
       show("sfxWrap", true);
       log(`<b>Online match.</b> You are ${this.seat === "p1" ? "Player 1" : "Player 2"}.`);
       FX.sfxMatchStart();
+      this._startClock(); // run the local turn clock (synced to the server on each view)
     },
     _showWaiting(code) {
       document.getElementById("onlineForms").classList.add("hide");
@@ -9350,6 +9383,7 @@ break a condition. Knowledge is the balance.</p>`;
     // Realtime channel is removed and matchId is nulled. Otherwise a late nudge could fetch + clobber an offline S.
     leave() {
       this._stopPoll();
+      this._stopClock();
       if (this.channel && sb) {
         try {
           sb.removeChannel(this.channel);
@@ -9362,6 +9396,7 @@ break a condition. Knowledge is the balance.</p>`;
       this.overShown = false;
       this.version = 0;
       this.prevTurn = null;
+      this._snap = null;
     },
 
     _msg(t, err) {
