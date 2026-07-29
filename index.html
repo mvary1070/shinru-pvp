@@ -9163,6 +9163,7 @@ break a condition. Knowledge is the balance.</p>`;
       this.subscribe();
       this._startPoll();
       await this.fetchView(); // joining already dealt + started the match
+      setTimeout(() => this._nudge(), 400); // once our channel is up, pull the waiting creator in immediately
     },
 
     async subscribe() {
@@ -9181,16 +9182,30 @@ break a condition. Knowledge is the balance.</p>`;
           } catch (e) {}
         }
         this.channel = sb
-          .channel("shinru-match-" + this.matchId)
+          .channel("shinru-match-" + this.matchId, { config: { broadcast: { self: false } } })
+          // BROADCAST nudge = the PRIMARY live path: the acting client pings the opponent directly (client→client
+          // via the Realtime server — no DB round-trip, no RLS, no replica-identity), so the opponent's board
+          // updates in a fraction of a second. This sidesteps postgres_changes latency entirely.
+          .on("broadcast", { event: "nudge" }, () => {
+            this._dbg("realtime: nudge → fetch view");
+            this.fetchView();
+          })
+          // postgres_changes = SECONDARY (needs RLS + replica identity); the ~4s poll is the final fallback.
           .on(
             "postgres_changes",
             { event: "UPDATE", schema: "public", table: "matches", filter: "id=eq." + this.matchId },
             () => {
-              this._dbg("realtime: match updated → fetch view");
-              this.fetchView(); // near-instant live push (the poll is only a fallback for missed events)
+              this._dbg("realtime: pg update → fetch view");
+              this.fetchView();
             },
           )
           .subscribe((status) => this._dbg("realtime: channel " + status));
+      } catch (e) {}
+    },
+    // ping the opponent to fetch the latest view NOW (near-instant broadcast; self:false so we don't ping ourselves)
+    _nudge() {
+      try {
+        if (this.channel) this.channel.send({ type: "broadcast", event: "nudge", payload: {} });
       } catch (e) {}
     },
     // RELIABLE FALLBACK: poll the (RLS-readable) matches row for status/version. This GUARANTEES the creator
@@ -9215,7 +9230,7 @@ break a condition. Knowledge is the balance.</p>`;
           else if (this.inBoard && typeof res.body.version === "number" && res.body.version > this.version)
             this.applyView(res.body); // safety net for a missed live update
         }
-        if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 6000 : 2000);
+        if (this.matchId) this._pollT = setTimeout(tick, this.inBoard ? 4000 : 2000);
       };
       this._pollT = setTimeout(tick, 1000);
     },
@@ -9279,6 +9294,7 @@ break a condition. Knowledge is the balance.</p>`;
           toast(this._friendly(res.body && res.body.error));
         } else {
           this.applyView(res.body);
+          this._nudge(); // push the new state to the opponent instantly (near-instant broadcast)
         }
       } finally {
         this.busy = false;
@@ -9301,14 +9317,29 @@ break a condition. Knowledge is the balance.</p>`;
       }
       this.prevTurn = view.turn;
       // AUDIO: the client doesn't run the rules (so it has no per-effect FX hooks) — approximate the sounds from the
-      // state diff since the last view: an impact on damage, a chime on heal, the turn cue when it becomes yours.
-      const snap = { meHp: view.me.hp, aiHp: view.ai.hp, turn: view.turn };
+      // PUBLIC state diff since the last view, for BOTH sides. (Prediction placement + Vault stashing are silent by
+      // design — hidden info — so they can't be sounded here.)
+      const _side = (p) => ({
+        hp: p.hp, shield: p.shield || 0, gold: p.gold || 0,
+        counter: p.counterTurns || 0, awaken: p.awakenAt, bleed: p.bleedTurns || 0, pass: (p.passives || []).length,
+      });
+      const snap = { me: _side(view.me), ai: _side(view.ai), turn: view.turn };
       if (prevSnap) {
+        const sfx = (cur, prev) => {
+          if (cur.hp < prev.hp) {
+            if (cur.shield === 0 && prev.shield > 0 && FX.sfxShieldBreak) FX.sfxShieldBreak(); // shatter
+            else if (FX.sfxHitHp) FX.sfxHitHp(prev.hp - cur.hp); // impact scaled to damage
+          } else if (cur.hp > prev.hp && FX.sfxHeal) FX.sfxHeal();
+          if (cur.shield > prev.shield && FX.sfxShieldUp) FX.sfxShieldUp();
+          if (cur.counter > prev.counter && FX.sfxCounter) FX.sfxCounter();
+          if (cur.bleed > prev.bleed && FX.sfxBleed) FX.sfxBleed();
+          if (cur.awaken !== null && prev.awaken === null && FX.sfxAwakenArm) FX.sfxAwakenArm();
+          if (cur.pass > prev.pass && FX.sfxPassive) FX.sfxPassive();
+          if (cur.gold < prev.gold && FX.sfxPurchase) FX.sfxPurchase(); // spent gold → a buy
+        };
         try {
-          const toMe = prevSnap.meHp - snap.meHp,
-            toOpp = prevSnap.aiHp - snap.aiHp;
-          if (toMe > 0 || toOpp > 0) { if (FX.sfxHitHp) FX.sfxHitHp(Math.max(toMe, toOpp)); }
-          else if (snap.meHp > prevSnap.meHp || snap.aiHp > prevSnap.aiHp) { if (FX.sfxHeal) FX.sfxHeal(); }
+          sfx(snap.me, prevSnap.me);
+          sfx(snap.ai, prevSnap.ai);
           if (snap.turn === "me" && prevSnap.turn !== "me" && FX.sfxTurnStart) FX.sfxTurnStart();
         } catch (e) {}
       }
